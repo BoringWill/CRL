@@ -13,14 +13,16 @@ class SlimeSelfPlayEnv(gym.Env):
         self.render_mode = render_mode
         self.action_space = spaces.Discrete(4)
         self.observation_space = spaces.Box(low=-1, high=1, shape=(12,), dtype=np.float32)
+
         self.screen = None
         self.clock = None
+        self.font = None
+
         self.p1_score = 0
         self.p2_score = 0
         self.win_score = 10
-        self.last_winner = None
-        self.waiting_to_start = True
-        self.t_limit = 5000
+        self.last_winner = 1
+        self.t_limit = 10000
         self.global_step_in_episode = 0
 
     def _get_obs(self, player_id):
@@ -39,25 +41,27 @@ class SlimeSelfPlayEnv(gym.Env):
         super().reset(seed=seed)
         self.p1_score = 0
         self.p2_score = 0
-        self.last_winner = None
         self.global_step_in_episode = 0
         self._internal_point_reset(full_reset=True)
         return self._get_obs(1), {}
 
     def _internal_point_reset(self, full_reset=False):
+        # 史莱姆回到各自初始位置
         self.p1 = Entity(200, GROUND_Y, SLIME_RADIUS, COLOR_P1)
         self.p2 = Entity(800, GROUND_Y, SLIME_RADIUS, COLOR_P2)
+
+        # 修改点：谁赢球谁发球
+        # full_reset 为 True 时默认 P1 发球，否则根据 last_winner 决定
         if full_reset:
-            self.ball = SlimeBall(NET_X, NET_Y - BALL_RADIUS - 20, BALL_RADIUS, COLOR_BALL)
-            self.ball.vx, self.ball.vy = 0, 0
-            self.waiting_to_start = True
+            spawn_x = 200
         else:
             spawn_x = 200 if self.last_winner == 1 else 800
-            self.ball = SlimeBall(spawn_x, 100, BALL_RADIUS, COLOR_BALL)
-            self.ball.vx, self.ball.vy = 0, 2.0
-            self.waiting_to_start = False
 
-    def step(self, action_p1, action_p2):
+        self.ball = SlimeBall(spawn_x, 150, BALL_RADIUS, COLOR_BALL)
+        self.ball.vx, self.ball.vy = 0, 1.0
+
+    def step(self, actions):
+        action_p1, action_p2 = actions
         self.global_step_in_episode += 1
         reward_p1 = 0.0
         terminated = False
@@ -73,44 +77,38 @@ class SlimeSelfPlayEnv(gym.Env):
 
         self.p1.apply_physics()
         self.p2.apply_physics()
+        self.ball.update()
+        self._custom_net_collision()
 
-        # 核心修改：触球即奖
-        if self.waiting_to_start:
-            if self.ball.check_player_collision(self.p1):
-                reward_p1 += 0.1  # P1 成功开球
-                self.waiting_to_start = False
-            elif self.ball.check_player_collision(self.p2):
-                self.waiting_to_start = False
-        else:
-            self.ball.update()
-            self._custom_net_collision()
-            if self.ball.check_player_collision(self.p1):
-                reward_p1 += 0.1  # 比赛中 P1 触球
-            self.ball.check_player_collision(self.p2)
+        self.ball.check_player_collision(self.p1)
+        self.ball.check_player_collision(self.p2)
 
         self.p1.x = max(self.p1.radius, min(NET_X - NET_WIDTH / 2 - self.p1.radius, self.p1.x))
         self.p2.x = max(NET_X + NET_WIDTH / 2 + self.p2.radius, min(WIDTH - self.p2.radius, self.p2.x))
 
         if self.ball.y >= GROUND_Y - self.ball.radius:
             if self.ball.x < WIDTH / 2:
+                # 修改点：P1 输球扣 2 分
+                reward_p1 = -2.0
                 self.p2_score += 1
                 self.last_winner = 2
-                # reward_p1 += 0 # P1 丢球不扣分或微扣
             else:
+                # P1 赢球得 1 分
+                reward_p1 = 2.0
                 self.p1_score += 1
-                reward_p1 += 1.0  # 赢球大奖
                 self.last_winner = 1
 
             if self.p1_score >= self.win_score or self.p2_score >= self.win_score:
                 terminated = True
             else:
+                # 触发得分后重置（包含发球位置逻辑）
                 self._internal_point_reset(full_reset=False)
 
         if self.global_step_in_episode >= self.t_limit:
             truncated = True
 
-        return self._get_obs(1), self._get_obs(2), reward_p1, terminated, truncated, {
-            "scores": (self.p1_score, self.p2_score)}
+        return self._get_obs(1), self._get_obs(2), reward_p1, terminated, truncated, {"p2_raw_obs": self._get_obs(2)}
+
     def _custom_net_collision(self):
         b = self.ball
         nl, nr = NET_X - NET_WIDTH / 2, NET_X + NET_WIDTH / 2
@@ -122,21 +120,26 @@ class SlimeSelfPlayEnv(gym.Env):
             b.x = nl - b.radius if b.x < NET_X else nr + b.radius
 
     def render(self):
-        if self.render_mode is None: return
+        if self.render_mode != "human": return
+
         if self.screen is None:
             pygame.init()
             self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+            pygame.display.set_caption("Slime Volleyball RL")
             self.font = pygame.font.SysFont("Arial", 24)
             self.clock = pygame.time.Clock()
 
         self.screen.fill(COLOR_BG)
         pygame.draw.rect(self.screen, COLOR_GROUND, (0, GROUND_Y, WIDTH, 50))
         pygame.draw.rect(self.screen, COLOR_NET, (NET_X - NET_WIDTH / 2, NET_Y, NET_WIDTH, NET_HEIGHT))
-        score_txt = self.font.render(f"{self.p1_score} : {self.p2_score}", True, (0, 0, 0))
-        self.screen.blit(score_txt, (WIDTH // 2 - 30, 20))
-        self.p1.draw_slime(self.screen);
-        self.p2.draw_slime(self.screen);
+
+        score_txt = self.font.render(f"P1: {self.p1_score} | P2: {self.p2_score}", True, (0, 0, 0))
+        self.screen.blit(score_txt, (WIDTH // 2 - 80, 20))
+
+        self.p1.draw_slime(self.screen)
+        self.p2.draw_slime(self.screen)
         self.ball.draw_ball(self.screen)
+
         pygame.display.flip()
         self.clock.tick(60)
 
@@ -159,8 +162,7 @@ class FrameStack(gym.Wrapper):
         return np.concatenate(list(self.frames), axis=0), info
 
     def step(self, actions):
-        act_p1, act_p2 = actions
-        obs_p1, obs_p2, reward, term, trunc, info = self.env.step(act_p1, act_p2)
+        obs_p1, obs_p2, reward, term, trunc, info = self.env.step(actions)
         self.frames.append(obs_p1)
         info["p2_raw_obs"] = obs_p2
         return np.concatenate(list(self.frames), axis=0), reward, term, trunc, info
