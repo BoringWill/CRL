@@ -102,4 +102,4 @@ def enjoy_game(human_mode=False):
 
 if __name__ == "__main__":
     # human_mode=True 时你可以用 A,D,W 控制左边的史莱姆
-    enjoy_game(human_mode=False)
+    enjoy_game(human_mode=True)

@@ -3,6 +3,7 @@ import pygame
 import math
 from constants import *
 
+
 class Entity:
     def __init__(self, x, y, radius, color):
         self.x, self.y = x, y
@@ -23,10 +24,16 @@ class Entity:
         pygame.draw.circle(screen, self.color, (int(self.x), int(self.y)), self.radius)
         pygame.draw.rect(screen, COLOR_BG, (self.x - self.radius, self.y, self.radius * 2, self.radius))
 
+
 class SlimeBall(Entity):
+    # --- 修改点 1: 初始化倍率 ---
+    def __init__(self, x, y, radius, color):
+        super().__init__(x, y, radius, color)
+        self.speed_multiplier = 1.0
+
     def draw_ball(self, screen):
-        # 球不需要切掉下半部分，直接画完整的圆
         pygame.draw.circle(screen, self.color, (int(self.x), int(self.y)), self.radius)
+
     def update(self):
         self.apply_physics()
         if self.x - self.radius < 0:
@@ -43,13 +50,21 @@ class SlimeBall(Entity):
 
         if dist < (self.radius + slime.radius) and self.y < slime.y:
             angle = math.atan2(dy, dx)
-            base_speed = 6
+
+            # --- 修改点 2: 基础速度乘以倍率 ---
+            base_speed = 4 * self.speed_multiplier
+            # 垂直向上的冲力也应该随倍率提升，否则球会感觉“飘”不起来
+            upward_force = -7 * self.speed_multiplier
+
             self.vx = math.cos(angle) * base_speed + slime.vx * 2.0
-            self.vy = math.sin(angle) * base_speed - 10 + slime.vy * 2.0
+            self.vy = math.sin(angle) * base_speed + upward_force + slime.vy * 2.0
 
             current_speed = math.sqrt(self.vx ** 2 + self.vy ** 2)
-            if current_speed > BALL_MAX_SPEED:
-                scale = BALL_MAX_SPEED / current_speed
+
+            # --- 修改点 3: 允许的最大速度上限也必须随倍率提升 ---
+            dynamic_max_speed = BALL_MAX_SPEED * self.speed_multiplier
+            if current_speed > dynamic_max_speed:
+                scale = dynamic_max_speed / current_speed
                 self.vx *= scale
                 self.vy *= scale
 

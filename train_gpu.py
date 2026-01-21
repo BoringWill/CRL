@@ -6,17 +6,18 @@ import gymnasium as gym
 from slime_env import SlimeSelfPlayEnv, FrameStack
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
+import time
 
 # --- 配置参数 ---
 config = {
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     "save_path": "slime_ppo_gpu.pth",
-    "total_timesteps": 10000000,
-    "num_envs": 24,
+    "total_timesteps": 20000000,
+    "num_envs": 32,
     "num_steps": 2048,
-    "update_epochs": 10,
-    "batch_size": 4096,
-    "lr": 3e-4,
+    "update_epochs": 4,
+    "batch_size": 8192,
+    "lr": 1e-3,
     "ent_coef": 0.05,
     "vf_coef": 0.5,
     "max_grad_norm": 0.5,
@@ -59,7 +60,10 @@ def train():
         print(">>> 从零启动...")
 
     optimizer = optim.Adam(agent.parameters(), lr=config["lr"])
-    writer = SummaryWriter("runs/slime_ppo_vs")
+
+    log_dir = f"runs/slime_ppo_{time.strftime('%Y%m%d-%H%M%S')}"
+    writer = SummaryWriter(log_dir)
+    print(f">>> 日志将保存至: {log_dir}")
 
     # 缓冲区
     obs_buf = torch.zeros((config["num_steps"], config["num_envs"] * 2, 48)).to(config["device"])
@@ -71,7 +75,9 @@ def train():
 
     obs_p1, _ = envs.reset()
     p2_deques = [deque(maxlen=4) for _ in range(config["num_envs"])]
-    temp_env = SlimeSelfPlayEnv();
+
+    # 获取初始状态用于填充
+    temp_env = SlimeSelfPlayEnv()
     temp_env.reset()
     init_p2_raw = temp_env._get_obs(2)
     for d in p2_deques: [d.append(init_p2_raw) for _ in range(4)]
@@ -79,10 +85,19 @@ def train():
 
     global_step = 0
 
+    # --- 修改点 1：将计数器移到 while 循环外，实现全局累加 ---
+    total_games_finished = 0
+    total_p1_wins = 0
+    total_p2_wins = 0
+
+    last_game_p1_score = 0
+    last_game_p2_score = 0
+
     while global_step < config["total_timesteps"]:
         agent.eval()
-        p1_rewards_list = []
-        p2_rewards_list = []
+
+        # 注意：这里不再每轮重置胜场，以便统计“总场次分之总赢次数”
+        # 如果你只想看本轮胜率，才在这里重置
 
         for step in range(config["num_steps"]):
             global_step += config["num_envs"]
@@ -93,31 +108,37 @@ def train():
             p1_acts, p2_acts = actions[:config["num_envs"]].cpu().numpy(), actions[config["num_envs"]:].cpu().numpy()
             n_obs_p1, reward, term, trunc, infos = envs.step(np.stack([p1_acts, p2_acts], axis=1))
 
+            # 检查是否有环境结束了一场比赛（10分）
+            for i in range(config["num_envs"]):
+                if term[i]:
+                    # 记录这局比赛的最终比分
+                    last_game_p1_score = infos["p1_score"][i]
+                    last_game_p2_score = infos["p2_score"][i]
+
+                    # 累加总局数
+                    total_games_finished += 1
+                    writer.add_scalar("Game_Score/P1", last_game_p1_score, total_games_finished)
+                    writer.add_scalar("Game_Score/P2", last_game_p2_score, total_games_finished)
+
+                    if infos["p1_score"][i] > infos["p2_score"][i]:
+                        total_p1_wins += 1
+                    else:
+                        total_p2_wins += 1
+
             for i in range(config["num_envs"]): p2_deques[i].append(infos["p2_raw_obs"][i])
             n_obs_p2 = np.array([np.concatenate(list(d), axis=0) for d in p2_deques])
 
             obs_buf[step], act_buf[step], logp_buf[step], val_buf[step] = t_obs, actions, logprobs, values.flatten()
-
             rew_buf[step, :config["num_envs"]] = torch.from_numpy(reward).to(config["device"])
             rew_buf[step, config["num_envs"]:] = torch.from_numpy(-reward).to(config["device"])
-
             done_buf[step] = torch.from_numpy((term | trunc).astype(np.float32)).repeat(2).to(config["device"])
+
             obs_p1, obs_p2 = n_obs_p1, n_obs_p2
 
-            # 收集有效奖励用于监控
-            valid_rewards = reward[reward != 0]
-            if len(valid_rewards) > 0:
-                p1_rewards_list.extend(valid_rewards.tolist())
-                p2_rewards_list.extend((-valid_rewards).tolist())
+        # --- 修改点 2：基于全局累加值计算总胜率 ---
+        global_win_rate = total_p1_wins / total_games_finished if total_games_finished > 0 else 0.5
 
-        # 计算本轮监控指标
-        m_p1_rew = np.mean(p1_rewards_list) if p1_rewards_list else 0.0
-        m_p2_rew = np.mean(p2_rewards_list) if p2_rewards_list else 0.0
-        p1_wins = np.sum(np.array(p1_rewards_list) > 0)
-        total_points = len(p1_rewards_list)
-        p1_win_rate = p1_wins / total_points if total_points > 0 else 0.5
-
-        # --- GAE 计算 ---
+        # GAE 计算
         with torch.no_grad():
             next_obs = torch.from_numpy(np.concatenate([obs_p1, obs_p2])).float().to(config["device"])
             _, _, _, next_val = agent.get_action_and_value(next_obs)
@@ -130,53 +151,47 @@ def train():
                 adv[t] = lastgae = delta + 0.99 * 0.95 * nt * lastgae
             ret = adv + val_buf
 
-        # --- 更新网络 ---
+        # 更新网络
         agent.train()
         b_obs, b_logp, b_act, b_adv, b_ret = obs_buf.reshape(-1, 48), logp_buf.reshape(-1), act_buf.reshape(
             -1), adv.reshape(-1), ret.reshape(-1)
         indices = np.arange(config["num_steps"] * config["num_envs"] * 2)
 
-        pg_losses, v_losses, ent_losses = [], [], []
+        pg_losses, v_losses = [], []
         for _ in range(config["update_epochs"]):
             np.random.shuffle(indices)
             for s in range(0, len(indices), config["batch_size"]):
                 mb = indices[s:s + config["batch_size"]]
                 _, newlogp, ent, newv = agent.get_action_and_value(b_obs[mb], b_act[mb])
-
                 ratio = (newlogp - b_logp[mb]).exp()
-                # 统一使用 m_adv
                 m_adv = (b_adv[mb] - b_adv[mb].mean()) / (b_adv[mb].std() + 1e-8)
-
                 pg_loss1 = -m_adv * ratio
                 pg_loss2 = -m_adv * torch.clamp(ratio, 0.8, 1.2)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
                 v_loss = 0.5 * ((newv.flatten() - b_ret[mb]) ** 2).mean()
-                entropy = ent.mean()
-
-                loss = pg_loss - config["ent_coef"] * entropy + v_loss * config["vf_coef"]
-
+                loss = pg_loss - config["ent_coef"] * ent.mean() + v_loss * config["vf_coef"]
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), config["max_grad_norm"])
                 optimizer.step()
-
                 pg_losses.append(pg_loss.item())
                 v_losses.append(v_loss.item())
-                ent_losses.append(entropy.item())
 
-        # --- 记录数据 ---
-        writer.add_scalar("VS/P1_Mean_Reward", m_p1_rew, global_step)
-        writer.add_scalar("VS/P2_Mean_Reward", m_p2_rew, global_step)
-        writer.add_scalar("VS/P1_Win_Rate", p1_win_rate, global_step)
+        # Tensorboard 记录
+        writer.add_scalar("GameWins/Global_Win_Rate", global_win_rate, global_step)
         writer.add_scalar("Loss/Policy", np.mean(pg_losses), global_step)
         writer.add_scalar("Loss/Value", np.mean(v_losses), global_step)
 
-        print(f"步数: {global_step:7d} | P1奖励: {m_p1_rew:+.2f} | P2奖励: {m_p2_rew:+.2f} | P1胜率: {p1_win_rate:.2%}")
+        # 打印信息
+        print(
+            f"步数: {global_step:7d} | 总局数: {total_games_finished} | 最近战报: P1 {last_game_p1_score}:{last_game_p2_score} P2 | "
+            f"P1总胜场: {total_p1_wins} | 总胜率: {global_win_rate:.2%}")
+
         torch.save(agent.state_dict(), config["save_path"])
 
-    envs.close();
+    envs.close()
     writer.close()
 
 
-if __name__ == "__main__": train()
+if __name__ == "__main__":
+    train()
