@@ -24,9 +24,8 @@ class SlimeSelfPlayEnv(gym.Env):
         # self.t_limit = 10000
         self.global_step_in_episode = 0
 
-        # 球速控制
+        # 球速控制 - 保持固定为 1.0
         self.ball_speed_multiplier = 1.0
-        self.speed_increase_rate = 0.1  # 每次提速 10%
 
     def _get_obs(self, player_id):
         p1, p2, b = self.p1, self.p2, self.ball
@@ -47,13 +46,11 @@ class SlimeSelfPlayEnv(gym.Env):
         self.p1_score = 0
         self.p2_score = 0
         self.global_step_in_episode = 0
-        # 球速重置逻辑已移至 _internal_point_reset
         self._internal_point_reset(full_reset=True)
         return self._get_obs(1), {}
 
     def _internal_point_reset(self, full_reset=False):
-        # --- 修改点：一方得分即重置球速和步数计时器 ---
-        self.ball_speed_multiplier = 1.0
+        # 每一球重置时保持步数计时器重置，球速恒定
         self.global_step_in_episode = 0
 
         # 史莱姆回到各自半场的中心位置
@@ -66,10 +63,10 @@ class SlimeSelfPlayEnv(gym.Env):
 
         self.ball = SlimeBall(spawn_x, 150, BALL_RADIUS, COLOR_BALL)
 
-        # 将当前倍率同步给球对象
+        # 将固定倍率同步给球对象
         self.ball.speed_multiplier = self.ball_speed_multiplier
 
-        # 发球速度应用当前的累积倍率
+        # 发球速度应用固定倍率
         self.ball.vx = 0
         self.ball.vy = 1.0 * self.ball_speed_multiplier
 
@@ -80,12 +77,7 @@ class SlimeSelfPlayEnv(gym.Env):
         terminated = False
         truncated = False
 
-        # --- 每 1000 步球速加快 ---
-        if self.global_step_in_episode > 0 and self.global_step_in_episode % 1000 == 0:
-            self.ball_speed_multiplier += self.speed_increase_rate
-            self.ball.speed_multiplier = self.ball_speed_multiplier
-            self.ball.vx *= (1.0 + self.speed_increase_rate)
-            self.ball.vy *= (1.0 + self.speed_increase_rate)
+        # --- 提速逻辑已删除，球速保持恒定 ---
 
         # 执行动作
         for p, a in [(self.p1, action_p1), (self.p2, action_p2)]:
@@ -124,8 +116,6 @@ class SlimeSelfPlayEnv(gym.Env):
             else:
                 self._internal_point_reset(full_reset=False)
 
-
-        # --- 修改点：在 info 中返回当前比分，方便训练脚本统计局胜数 ---
         return (self._get_obs(1),
                 self._get_obs(2),
                 reward_p1,
@@ -134,7 +124,8 @@ class SlimeSelfPlayEnv(gym.Env):
                 {
                     "p2_raw_obs": self._get_obs(2),
                     "p1_score": self.p1_score,
-                    "p2_score": self.p2_score
+                    "p2_score": self.p2_score,
+                    "episode_steps": self.global_step_in_episode # 方便训练脚本记录步数
                 })
 
     def _custom_net_collision(self):

@@ -7,6 +7,7 @@ from slime_env import SlimeSelfPlayEnv, FrameStack
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
 import time
+import os  # 新增：用于处理文件夹和路径
 
 # --- 配置参数 ---
 config = {
@@ -22,6 +23,8 @@ config = {
     "min_ent_coef": 0.01,  # 最小熵系数目标
     "vf_coef": 0.5,
     "max_grad_norm": 0.5,
+    "model_set_dir": "模型集_selfplay",  # 新增：模型保存文件夹
+    "save_interval": 1000000,           # 新增：保存间隔步数
 }
 
 
@@ -51,6 +54,10 @@ def make_env():
 
 
 def train():
+    # 新增：创建模型集文件夹
+    if not os.path.exists(config["model_set_dir"]):
+        os.makedirs(config["model_set_dir"])
+
     envs = gym.vector.AsyncVectorEnv([make_env() for _ in range(config["num_envs"])])
     agent = Agent().to(config["device"])
 
@@ -85,6 +92,7 @@ def train():
     obs_p2 = np.array([np.concatenate(list(d), axis=0) for d in p2_deques])
 
     global_step = 0
+    last_save_step = 0 # 新增：记录上次保存时的步数
 
     total_games_finished = 0
     total_p1_wins = 0
@@ -197,6 +205,14 @@ def train():
             f"P1总胜场: {total_p1_wins} | 总胜率: {global_win_rate:.2%}")
 
         torch.save(agent.state_dict(), config["save_path"])
+
+        # 新增：每 1000000 步保存一个阶段性模型
+        if global_step - last_save_step >= config["save_interval"]:
+            save_name = f"slime_ppo_{global_step // 1000000}M.pth"
+            save_path = os.path.join(config["model_set_dir"], save_name)
+            torch.save(agent.state_dict(), save_path)
+            print(f">>> 阶段性模型已保存至: {save_path}")
+            last_save_step = (global_step // config["save_interval"]) * config["save_interval"]
 
     envs.close()
     writer.close()
