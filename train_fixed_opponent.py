@@ -12,10 +12,13 @@ import time
 # --- 配置参数 ---
 config = {
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    "save_path": "slime_ppo_vs_fixed.pth",  # 训练产出的模型保存文件名
-    "p1_path": "模型集_opponent/train_20260123-200349/slime_ppo_vs_fixed.pth",    # P1 初始权重路径 (用于加载)
-    "p2_path": "模型集_opponent/train_20260123-193056/slime_ppo_vs_fixed.pth", # P2 初始权重路径 (用于加载)
-    "total_timesteps": 20000000,
+    "save_path": "slime_ppo_vs_fixed.pth",
+    "p1_path": "模型集_opponent/train_20260124-000323/slime_ppo_8M.pth",
+    "p2_path": "模型集_opponent/train_20260124-000323/slime_ppo_8M.pth",
+    "p2_epsilon": 0.05,
+    "auto_replace_threshold": 0.80,
+    "min_games_to_replace": 400,
+    "total_timesteps": 300000000,
     "num_envs": 32,
     "num_steps": 2048,
     "update_epochs": 10,
@@ -54,7 +57,6 @@ def make_env():
 
 
 def train():
-    # --- 新增：创建以训练时间命名的专属文件夹 ---
     timestamp = time.strftime('%Y%m%d-%H%M%S')
     checkpoint_root = "模型集_opponent"
     current_run_dir = os.path.join(checkpoint_root, f"train_{timestamp}")
@@ -62,41 +64,33 @@ def train():
     if not os.path.exists(current_run_dir):
         os.makedirs(current_run_dir)
 
-    # 动态更新保存路径，使其指向该时间文件夹
     current_save_path = os.path.join(current_run_dir, config["save_path"])
+    opponent_model_path = os.path.join(current_run_dir, "fixed_opponent_current.pth")
 
-    # 1. 初始化环境
     envs = gym.vector.AsyncVectorEnv([make_env() for _ in range(config["num_envs"])])
 
-    # 2. 初始化模型
-    agent = Agent().to(config["device"])  # 正在学习的模型 (P1)
-    opponent = Agent().to(config["device"])  # 固定的最强权重 (P2)
+    agent = Agent().to(config["device"])
+    opponent = Agent().to(config["device"])
 
-    # --- 新增：加载 P1 之前的训练进度以实现续训 ---
-    # 修改：使用 config["p1_path"] 来决定 P1 具体是谁
     if os.path.exists(config["p1_path"]):
         try:
             agent.load_state_dict(torch.load(config["p1_path"], map_location=config["device"], weights_only=False))
             print(f">>> 成功加载 P1 初始权重: {config['p1_path']}")
         except Exception as e:
-            print(f">>> 加载 P1 权重失败，从随机初始化开始: {e}")
-    else:
-        print(f">>> 未找到 P1 权重文件 {config['p1_path']}，从头开始训练。")
+            print(f">>> 加载 P1 权重失败: {e}")
 
-    # 加载 P2 权重
-    # 修改：使用 config["p2_path"] 来决定 P2 具体是谁
     if os.path.exists(config["p2_path"]):
         opponent.load_state_dict(torch.load(config["p2_path"], map_location=config["device"], weights_only=False))
-        opponent.eval()  # 锁定 P2
+        opponent.eval()
+        torch.save(opponent.state_dict(), opponent_model_path)
         print(f">>> 成功加载 P2 权重: {config['p2_path']}")
     else:
-        print(f">>> 警告: 未找到 {config['p2_path']}，请检查路径。")
+        print(f">>> 警告: 未找到 {config['p2_path']}")
         return
 
     optimizer = optim.Adam(agent.parameters(), lr=config["lr"])
     writer = SummaryWriter(f"runs/vs_fixed_{timestamp}")
 
-    # 3. 缓冲区 (只存储 P1 的数据)
     obs_buf = torch.zeros((config["num_steps"], config["num_envs"], 48)).to(config["device"])
     act_buf = torch.zeros((config["num_steps"], config["num_envs"])).to(config["device"])
     logp_buf = torch.zeros((config["num_steps"], config["num_envs"])).to(config["device"])
@@ -104,73 +98,98 @@ def train():
     done_buf = torch.zeros((config["num_steps"], config["num_envs"])).to(config["device"])
     val_buf = torch.zeros((config["num_steps"], config["num_envs"])).to(config["device"])
 
-    obs_p1, _ = envs.reset()
-    # P2 的 FrameStack 逻辑
+    obs_p1, infos = envs.reset()
     p2_deques = [deque(maxlen=4) for _ in range(config["num_envs"])]
-    temp_env = SlimeSelfPlayEnv()
-    temp_env.reset()
-    init_p2_raw = temp_env._get_obs(2)
-    for d in p2_deques: [d.append(init_p2_raw) for _ in range(4)]
+
+    # 修正初始化逻辑
+    for i in range(config["num_envs"]):
+        init_p2 = infos["p2_raw_obs"][i] if "p2_raw_obs" in infos else np.zeros(12)
+        for _ in range(4): p2_deques[i].append(init_p2)
     obs_p2 = np.array([np.concatenate(list(d), axis=0) for d in p2_deques])
 
     global_step = 0
     total_games = 0
-    p1_wins = 0
-    recent_wins = deque(maxlen=10)  # 新增：记录最近10局的胜负 (1为胜，0为负)
-    last_save_step = 0  # 用于记录上次保存权重的步数
+    agent_wins = 0  # 统计 Agent (即正在训练的模型) 的胜场
+    evolution_count = 0
+    recent_wins = deque(maxlen=10)
+    last_save_step = 0
 
     while global_step < config["total_timesteps"]:
         agent.eval()
-
-        # 熵系数衰减
         frac = max(0.0, 1.0 - (global_step / config["total_timesteps"]))
         current_ent_coef = config["min_ent_coef"] + (config["ent_coef"] - config["min_ent_coef"]) * frac
 
-        # --- 采样阶段 ---
+        # 核心修改：每轮采样前随机交换 Agent 的物理位置，解决视角拟合问题
+        side_swapped = np.random.rand(config["num_envs"]) > 0.5
+
         for step in range(config["num_steps"]):
             global_step += config["num_envs"]
 
-            t_obs_p1 = torch.from_numpy(obs_p1).float().to(config["device"])
-            t_obs_p2 = torch.from_numpy(obs_p2).float().to(config["device"])
+            t_obs_agent = torch.zeros((config["num_envs"], 48)).to(config["device"])
+            t_obs_opp = torch.zeros((config["num_envs"], 48)).to(config["device"])
+
+            for i in range(config["num_envs"]):
+                if not side_swapped[i]:
+                    t_obs_agent[i] = torch.from_numpy(obs_p1[i]).float()
+                    t_obs_opp[i] = torch.from_numpy(obs_p2[i]).float()
+                else:
+                    t_obs_agent[i] = torch.from_numpy(obs_p2[i]).float()
+                    t_obs_opp[i] = torch.from_numpy(obs_p1[i]).float()
 
             with torch.no_grad():
-                # P1 采样 (学习中)
-                actions_p1, logp_p1, _, values_p1 = agent.get_action_and_value(t_obs_p1)
-                # P2 决策 (最强权重使用 argmax)
-                actions_p2 = torch.argmax(opponent.actor(t_obs_p2), dim=1)
+                actions_agent, logp_agent, _, values_agent = agent.get_action_and_value(t_obs_agent)
+                logits_opp = opponent.actor(t_obs_opp)
+                actions_opp = torch.distributions.Categorical(logits=logits_opp).sample()
 
-            # 推进环境
-            n_obs_p1, reward, term, trunc, infos = envs.step(
-                np.stack([actions_p1.cpu().numpy(), actions_p2.cpu().numpy()], axis=1))
-
-            # 记录数据
+            env_actions = np.zeros((config["num_envs"], 2), dtype=np.int32)
             for i in range(config["num_envs"]):
+                if not side_swapped[i]:
+                    env_actions[i] = [actions_agent[i].item(), actions_opp[i].item()]
+                else:
+                    env_actions[i] = [actions_opp[i].item(), actions_agent[i].item()]
+
+            n_obs_p1, reward, term, trunc, infos = envs.step(env_actions)
+
+            for i in range(config["num_envs"]):
+                # 奖励转换：如果 Agent 在 P2 位置，reward 需取反（因为环境默认 reward 是给 P1 的）
+                agent_step_reward = reward[i] if not side_swapped[i] else -reward[i]
+                rew_buf[step][i] = agent_step_reward
+
                 if term[i] or trunc[i]:
                     total_games += 1
-                    is_win = 1 if infos["p1_score"][i] > infos["p2_score"][i] else 0
-                    p1_wins += is_win
-                    recent_wins.append(is_win)  # 更新最近比赛记录
+                    # 统计 Agent 的胜负 (无论它在 P1 还是 P2)
+                    if not side_swapped[i]:
+                        is_agent_win = 1 if infos["p1_score"][i] > infos["p2_score"][i] else 0
+                    else:
+                        is_agent_win = 1 if infos["p2_score"][i] > infos["p1_score"][i] else 0
 
-                    # 记录每局步数
+                    agent_wins += is_agent_win
+                    recent_wins.append(is_agent_win)
+
+                    # 保留原有的 TensorBoard 记录
                     if "episode_steps" in infos:
                         writer.add_scalar("Game/Episode_Steps", infos["episode_steps"][i], total_games)
 
-            # 更新 P2 观测
-            for i in range(config["num_envs"]): p2_deques[i].append(infos["p2_raw_obs"][i])
-            n_obs_p2 = np.array([np.concatenate(list(d), axis=0) for d in p2_deques])
+                    # 重置该环境的 P2 帧缓存
+                    p2_deques[i].clear()
+                    for _ in range(4): p2_deques[i].append(infos["p2_raw_obs"][i])
+                else:
+                    p2_deques[i].append(infos["p2_raw_obs"][i])
 
-            # 填充缓冲区
-            obs_buf[step], act_buf[step], logp_buf[step], val_buf[
-                step] = t_obs_p1, actions_p1, logp_p1, values_p1.flatten()
-            rew_buf[step] = torch.from_numpy(reward).to(config["device"])
+            obs_buf[step], act_buf[step], logp_buf[step], val_buf[step] = \
+                t_obs_agent, actions_agent, logp_agent, values_agent.flatten()
             done_buf[step] = torch.from_numpy((term | trunc).astype(np.float32)).to(config["device"])
 
-            obs_p1, obs_p2 = n_obs_p1, n_obs_p2
+            obs_p1 = n_obs_p1
+            obs_p2 = np.array([np.concatenate(list(d), axis=0) for d in p2_deques])
 
-        # --- 计算优势 (GAE) ---
+        # GAE 计算
         with torch.no_grad():
-            next_obs = torch.from_numpy(obs_p1).float().to(config["device"])
-            _, _, _, next_val = agent.get_action_and_value(next_obs)
+            t_next_obs = torch.zeros((config["num_envs"], 48)).to(config["device"])
+            for i in range(config["num_envs"]):
+                t_next_obs[i] = torch.from_numpy(obs_p2[i] if side_swapped[i] else obs_p1[i]).float()
+            _, _, _, next_val = agent.get_action_and_value(t_next_obs)
+
             adv = torch.zeros_like(rew_buf).to(config["device"])
             lastgae = 0
             for t in reversed(range(config["num_steps"])):
@@ -180,59 +199,51 @@ def train():
                 adv[t] = lastgae = delta + 0.99 * 0.95 * nt * lastgae
             ret = adv + val_buf
 
-        # --- PPO 更新阶段 ---
+        # PPO 更新
         agent.train()
-        b_obs = obs_buf.reshape(-1, 48)
-        b_logp = logp_buf.reshape(-1)
-        b_act = act_buf.reshape(-1)
-        b_adv = adv.reshape(-1)
-        b_ret = ret.reshape(-1)
-
+        b_obs, b_logp, b_act, b_adv, b_ret = obs_buf.reshape(-1, 48), logp_buf.reshape(-1), act_buf.reshape(
+            -1), adv.reshape(-1), ret.reshape(-1)
         indices = np.arange(config["num_steps"] * config["num_envs"])
         for _ in range(config["update_epochs"]):
             np.random.shuffle(indices)
             for s in range(0, len(indices), config["batch_size"]):
                 mb = indices[s:s + config["batch_size"]]
                 _, newlogp, ent, newv = agent.get_action_and_value(b_obs[mb], b_act[mb])
-
                 ratio = (newlogp - b_logp[mb]).exp()
                 m_adv = (b_adv[mb] - b_adv[mb].mean()) / (b_adv[mb].std() + 1e-8)
-
-                pg_loss1 = -m_adv * ratio
-                pg_loss2 = -m_adv * torch.clamp(ratio, 0.8, 1.2)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
+                pg_loss = torch.max(-m_adv * ratio, -m_adv * torch.clamp(ratio, 0.8, 1.2)).mean()
                 v_loss = 0.5 * ((newv.flatten() - b_ret[mb]) ** 2).mean()
                 loss = pg_loss - current_ent_coef * ent.mean() + v_loss * config["vf_coef"]
-
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), config["max_grad_norm"])
+                optimizer.zero_grad();
+                loss.backward();
+                nn.utils.clip_grad_norm_(agent.parameters(), 0.5);
                 optimizer.step()
 
-        # --- 记录日志与保存逻辑 ---
-        total_win_rate = p1_wins / total_games if total_games > 0 else 0
-        recent_win_rate = sum(recent_wins) / len(recent_wins) if len(recent_wins) > 0 else 0
+        # 计算并记录训练模型的胜率
+        total_agent_win_rate = agent_wins / total_games if total_games > 0 else 0
+        recent_agent_win_rate = sum(recent_wins) / len(recent_wins) if len(recent_wins) > 0 else 0
 
-        writer.add_scalar("Train/Total_Win_Rate", total_win_rate, global_step)
-        writer.add_scalar("Train/Recent_Win_Rate", recent_win_rate, global_step)
+        writer.add_scalar("Train/Total_Win_Rate", total_agent_win_rate, global_step)
+        writer.add_scalar("Train/Recent_Win_Rate", recent_agent_win_rate, global_step)
 
-        # 修改后的输出格式：包含总胜率和最近10局胜率
+        if total_games >= config["min_games_to_replace"] and total_agent_win_rate >= config["auto_replace_threshold"]:
+            evolution_count += 1
+            print(f"\n[进化] 模型胜率 {total_agent_win_rate:.2%} 达标！更替考官...")
+            torch.save(agent.state_dict(), opponent_model_path)
+            opponent.load_state_dict(torch.load(opponent_model_path))
+            opponent.eval()
+            torch.save(agent.state_dict(), os.path.join(current_run_dir, f"evolution_v{evolution_count}.pth"))
+            total_games, agent_wins = 0, 0
+            recent_wins.clear()
+
         print(
-            f"总步数: {global_step:7d} | 总胜率: {total_win_rate:.2%} | 最近10局胜率: {recent_win_rate:.2%} | 对局数: {total_games}")
-
-        # 1. 保存最新权重 (保存到当前时间文件夹内)
+            f"步数: {global_step:7d} | 学生模型胜率: {total_agent_win_rate:.2%} | 进化: {evolution_count} | 局数: {total_games}")
         torch.save(agent.state_dict(), current_save_path)
-
-        # 2. 每 1,000,000 步保存一个独立权重到专属时间文件夹内
         if (global_step - last_save_step) >= 1000000:
-            ckpt_name = f"slime_ppo_{global_step // 1000000}M.pth"
-            ckpt_path = os.path.join(current_run_dir, ckpt_name)
-            torch.save(agent.state_dict(), ckpt_path)
+            torch.save(agent.state_dict(), os.path.join(current_run_dir, f"slime_ppo_{global_step // 1000000}M.pth"))
             last_save_step = global_step
-            print(f">>> 已保存阶段性权重: {ckpt_path}")
 
-    envs.close()
+    envs.close();
     writer.close()
 
 

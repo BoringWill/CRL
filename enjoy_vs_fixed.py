@@ -7,8 +7,8 @@ from collections import deque
 from slime_env import SlimeSelfPlayEnv, FrameStack
 
 # --- 配置与路径 ---
-MODEL_P1_PATH = "模型集_selfplay/run_20260123-185640/slime_ppo_11M.pth"  # slime_ppo_vs_fixed.pth  ||  模型集/slime_ppo_gpu_v4.pth
-MODEL_P2_PATH = "模型集_opponent/train_20260123-193056/slime_ppo_vs_fixed.pth"
+MODEL_P1_PATH = "模型集/slime_ppo_gpu_v4.pth"  # slime_ppo_vs_fixed.pth  ||  模型集/slime_ppo_gpu_v4.pth
+MODEL_P2_PATH = "模型集_opponent/train_20260124-004321/slime_ppo_4M.pth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
