@@ -12,8 +12,9 @@ import time
 # --- 配置参数 ---
 config = {
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    "save_path": "slime_ppo_vs_fixed.pth",  # 训练产出的模型保存路径 (P1)
-    "opponent_path": "模型集/slime_ppo_gpu_v2.pth",  # 固定对手权重 (P2)
+    "save_path": "slime_ppo_vs_fixed.pth",  # 训练产出的模型保存文件名
+    "p1_path": "模型集_opponent/train_20260123-200349/slime_ppo_vs_fixed.pth",    # P1 初始权重路径 (用于加载)
+    "p2_path": "模型集_opponent/train_20260123-193056/slime_ppo_vs_fixed.pth", # P2 初始权重路径 (用于加载)
     "total_timesteps": 20000000,
     "num_envs": 32,
     "num_steps": 2048,
@@ -53,10 +54,16 @@ def make_env():
 
 
 def train():
-    # 确保保存目录存在
-    checkpoint_dir = "模型集_opponent"
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
+    # --- 新增：创建以训练时间命名的专属文件夹 ---
+    timestamp = time.strftime('%Y%m%d-%H%M%S')
+    checkpoint_root = "模型集_opponent"
+    current_run_dir = os.path.join(checkpoint_root, f"train_{timestamp}")
+
+    if not os.path.exists(current_run_dir):
+        os.makedirs(current_run_dir)
+
+    # 动态更新保存路径，使其指向该时间文件夹
+    current_save_path = os.path.join(current_run_dir, config["save_path"])
 
     # 1. 初始化环境
     envs = gym.vector.AsyncVectorEnv([make_env() for _ in range(config["num_envs"])])
@@ -66,26 +73,28 @@ def train():
     opponent = Agent().to(config["device"])  # 固定的最强权重 (P2)
 
     # --- 新增：加载 P1 之前的训练进度以实现续训 ---
-    if os.path.exists(config["save_path"]):
+    # 修改：使用 config["p1_path"] 来决定 P1 具体是谁
+    if os.path.exists(config["p1_path"]):
         try:
-            agent.load_state_dict(torch.load(config["save_path"], map_location=config["device"], weights_only=False))
-            print(f">>> 成功加载 P1 续训权重: {config['save_path']}")
+            agent.load_state_dict(torch.load(config["p1_path"], map_location=config["device"], weights_only=False))
+            print(f">>> 成功加载 P1 初始权重: {config['p1_path']}")
         except Exception as e:
             print(f">>> 加载 P1 权重失败，从随机初始化开始: {e}")
     else:
-        print(">>> 未找到 P1 历史权重，从头开始训练。")
+        print(f">>> 未找到 P1 权重文件 {config['p1_path']}，从头开始训练。")
 
     # 加载 P2 权重
-    if os.path.exists(config["opponent_path"]):
-        opponent.load_state_dict(torch.load(config["opponent_path"], map_location=config["device"], weights_only=False))
+    # 修改：使用 config["p2_path"] 来决定 P2 具体是谁
+    if os.path.exists(config["p2_path"]):
+        opponent.load_state_dict(torch.load(config["p2_path"], map_location=config["device"], weights_only=False))
         opponent.eval()  # 锁定 P2
-        print(f">>> 成功加载固定对手: {config['opponent_path']}")
+        print(f">>> 成功加载 P2 权重: {config['p2_path']}")
     else:
-        print(f">>> 警告: 未找到 {config['opponent_path']}，请检查路径。")
+        print(f">>> 警告: 未找到 {config['p2_path']}，请检查路径。")
         return
 
     optimizer = optim.Adam(agent.parameters(), lr=config["lr"])
-    writer = SummaryWriter(f"runs/vs_fixed_{time.strftime('%Y%m%d-%H%M%S')}")
+    writer = SummaryWriter(f"runs/vs_fixed_{timestamp}")
 
     # 3. 缓冲区 (只存储 P1 的数据)
     obs_buf = torch.zeros((config["num_steps"], config["num_envs"], 48)).to(config["device"])
@@ -212,13 +221,13 @@ def train():
         print(
             f"总步数: {global_step:7d} | 总胜率: {total_win_rate:.2%} | 最近10局胜率: {recent_win_rate:.2%} | 对局数: {total_games}")
 
-        # 1. 保存最新权重 (覆盖)
-        torch.save(agent.state_dict(), config["save_path"])
+        # 1. 保存最新权重 (保存到当前时间文件夹内)
+        torch.save(agent.state_dict(), current_save_path)
 
-        # 2. 每 1,000,000 步保存一个独立权重到文件夹
+        # 2. 每 1,000,000 步保存一个独立权重到专属时间文件夹内
         if (global_step - last_save_step) >= 1000000:
             ckpt_name = f"slime_ppo_{global_step // 1000000}M.pth"
-            ckpt_path = os.path.join(checkpoint_dir, ckpt_name)
+            ckpt_path = os.path.join(current_run_dir, ckpt_name)
             torch.save(agent.state_dict(), ckpt_path)
             last_save_step = global_step
             print(f">>> 已保存阶段性权重: {ckpt_path}")

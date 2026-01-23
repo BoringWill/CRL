@@ -34,7 +34,7 @@ def enjoy_game(human_mode=False):
     # 2. 加载模型
     agent = Agent().to(device)
     try:
-        state_dict = torch.load("slime_ppo_gpu.pth", map_location=device)
+        state_dict = torch.load("模型集_opponent/train_20260123-193056/slime_ppo_vs_fixed.pth", map_location=device)  # 或者slime_ppo_vs_fixed.pth
         agent.load_state_dict(state_dict)
         agent.eval()
         print(">>> 模型加载成功，开始对战！")
@@ -102,4 +102,4 @@ def enjoy_game(human_mode=False):
 
 if __name__ == "__main__":
     # human_mode=True 时你可以用 A,D,W 控制左边的史莱姆
-    enjoy_game(human_mode=False)
+    enjoy_game(human_mode=True)
