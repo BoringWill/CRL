@@ -9,8 +9,8 @@ import gymnasium as gym
 
 # --- 超参数配置 ---
 CONFIG = {
-    "model_path_a": "模型集_历代版本最强/evolution_v1.pth",
-    "model_path_b": "模型集_opponent/train_20260124-152719/evolution_v3.pth",
+    "model_path_a": "模型集_opponent/train_20260125-013011/evolution_v4.pth",
+    "model_path_b": "模型集_opponent/train_20260125-013011/evolution_v3.pth",
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     "num_envs": 8,  # 并行线程数
     "total_test_games": 20,  # 对抗测试的总局数（超参数）

@@ -7,13 +7,13 @@ from collections import deque
 from slime_env import SlimeSelfPlayEnv, FrameStack
 
 # --- 配置 ---
-NEW_MODEL_PATH = "模型集_opponent/train_20260124-152719/evolution_v10.pth"
-HISTORY_FOLDER = "想要对抗的模型集"
+NEW_MODEL_PATH = "模型集_opponent/train_20260125-013011/fixed_opponent_current.pth"
+HISTORY_FOLDER = "模型集_opponent/train_20260125-013011"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 测试参数
-NUM_ENVS = 8
-GAMES_PER_OPPONENT = 20
+NUM_ENVS = 4
+GAMES_PER_OPPONENT = 10
 
 
 # --- 模型结构 ---
@@ -48,13 +48,14 @@ def run_vector_battle(envs, agent_new, agent_hist, num_total_games):
 
     obs_p1, infos = envs.reset()
     p2_deques = [deque(maxlen=4) for _ in range(NUM_ENVS)]
+
+    # 修正初始化拿取逻辑
+    p2_raw_initial = infos.get("p2_raw_obs")
     for i in range(NUM_ENVS):
-        init_p2 = infos["p2_raw_obs"][i] if "p2_raw_obs" in infos else np.zeros(12)
+        init_p2 = p2_raw_initial[i] if p2_raw_initial is not None else np.zeros(12)
         for _ in range(4): p2_deques[i].append(init_p2)
     obs_p2 = np.array([np.concatenate(list(d), axis=0) for d in p2_deques])
 
-    # --- 核心修改：初始化随机分配角色 ---
-    # side_swapped[i] 为 True 代表新模型在 P2 位置
     side_swapped = np.random.rand(NUM_ENVS) > 0.5
 
     while games_finished < num_total_games:
@@ -81,11 +82,13 @@ def run_vector_battle(envs, agent_new, agent_hist, num_total_games):
 
         obs_p1, rewards, terms, truncs, infos = envs.step(env_actions)
 
+        # 核心修复：获取当前所有环境的 p2_raw_obs
+        p2_raw_batch = infos.get("p2_raw_obs")
+
         for i in range(NUM_ENVS):
             if terms[i] or truncs[i]:
                 games_finished += 1
 
-                # 统计胜负
                 p1_won = infos["p1_score"][i] > infos["p2_score"][i]
                 p2_won = infos["p2_score"][i] > infos["p1_score"][i]
 
@@ -94,14 +97,20 @@ def run_vector_battle(envs, agent_new, agent_hist, num_total_games):
                 else:
                     if p2_won: new_model_wins += 1
 
-                # --- 核心修改：一局结束后重新随机分配角色 ---
                 side_swapped[i] = np.random.rand() > 0.5
 
                 p2_deques[i].clear()
-                for _ in range(4): p2_deques[i].append(infos["p2_raw_obs"][i])
+                # 结束帧处理
+                res_p2 = p2_raw_batch[i] if p2_raw_batch is not None else np.zeros(12)
+                for _ in range(4): p2_deques[i].append(res_p2)
                 if games_finished >= num_total_games: break
             else:
-                p2_deques[i].append(infos["p2_raw_obs"][i])
+                # 普通帧处理
+                if p2_raw_batch is not None:
+                    p2_deques[i].append(p2_raw_batch[i])
+                else:
+                    # 如果该帧没有返回 p2_raw_obs，为了维持 4 帧缓存，重用上一帧
+                    p2_deques[i].append(p2_deques[i][-1])
 
         obs_p2 = np.array([np.concatenate(list(d), axis=0) for d in p2_deques])
 
@@ -118,6 +127,10 @@ def main():
         return
     agent_new.load_state_dict(torch.load(NEW_MODEL_PATH, map_location=DEVICE))
     agent_new.eval()
+
+    if not os.path.exists(HISTORY_FOLDER):
+        print(f"找不到文件夹: {HISTORY_FOLDER}")
+        return
 
     history_files = [f for f in os.listdir(HISTORY_FOLDER) if f.endswith('.pth')]
     history_files.sort()
