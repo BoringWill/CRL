@@ -15,38 +15,40 @@ import random
 config = {
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     "save_path": "slime_ppo_vs_fixed.pth",
-    "p1_path": "模型集_opponent/train_20260125-013011/evolution_v4.pth",
-    "p2_path": "模型集_opponent/train_20260125-013011/evolution_v4.pth",
-    "resume_dir": "模型集_opponent/train_20260125-013011",
-    "start_step": 4128768,
-    "p2_epsilon": 0.05,
-    "auto_replace_threshold": 0.80,
-    "min_games_to_replace": 30,
-    "total_timesteps": 30000000,
+    "p1_path": "模型集_opponent/train_20260128-172434/slime_ppo_vs_fixed.pth",
+    "p2_path": "模型集_opponent/train_20260128-172434/slime_ppo_vs_fixed.pth",
+    "resume_dir": "模型集_opponent/train_20260128-172434",
+    "external_history_folder": "最强模型集",
+    "start_step": 0,
+    "auto_replace_threshold": 0.70,
+    "win_rate_window": 150,
+    "total_timesteps": 30_000_000,
     "num_envs": 32,
-    "num_steps": 128,
+    "num_steps": 256,
     "update_epochs": 4,
-    "batch_size": 1024,
+    "batch_size": 2048,
     "lr": 2.5e-4,
     "ent_coef": 0.01,
     "vf_coef": 0.5,
     "max_grad_norm": 0.5,
     "openai_eta": 0.1,
     "historical_ratio": 0.4,
-    "save_every_n_evolutions": 10,
+    "alpha_sampling": 0.1,
+    "save_every_n_evolutions": 5,
 }
 
 
 class Agent(nn.Module):
     def __init__(self):
         super(Agent, self).__init__()
+        # 维度更新：13 (特征数) * 4 (堆叠帧) = 52
         self.critic = nn.Sequential(
-            nn.Linear(48, 256), nn.ReLU(),
+            nn.Linear(52, 256), nn.ReLU(),
             nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, 1)
         )
         self.actor = nn.Sequential(
-            nn.Linear(48, 256), nn.ReLU(),
+            nn.Linear(52, 256), nn.ReLU(),
             nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, 4)
         )
@@ -79,60 +81,82 @@ def train():
 
     envs = gym.vector.AsyncVectorEnv([make_env() for _ in range(config["num_envs"])])
     agent = Agent().to(config["device"])
-    opponents = [Agent().to(config["device"]) for _ in range(config["num_envs"])]
 
-    # --- 初始化变量 ---
+    opponents = [Agent().to(config["device"]) for _ in range(config["num_envs"])]
+    for opp in opponents:
+        opp.eval()
+        for param in opp.parameters(): param.requires_grad = False
+
     global_step = config["start_step"]
     evolution_count = 0
     evolution_trigger_count = 0
     total_games = 0
     agent_wins = 0
-    opponent_pool_paths = []
-    q_scores = []
-    recent_wins = deque(maxlen=10)
+    recent_wins = deque(maxlen=config["win_rate_window"])
 
-    # --- 1. 加载学生模型及统计数据 ---
+    games_after_evolution = 0
+    WARMUP_GAMES = 30
+
+    # --- 1. Agent 权重加载逻辑修改 ---
     if os.path.exists(current_save_path):
+        # 优先从当前训练目录恢复
         checkpoint = torch.load(current_save_path, map_location=config["device"])
-        # 兼容旧版本只保存权重的情况
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
             agent.load_state_dict(checkpoint["model_state_dict"])
             total_games = checkpoint.get("total_games", 0)
             agent_wins = checkpoint.get("agent_wins", 0)
             evolution_trigger_count = checkpoint.get("evolution_trigger_count", 0)
-            print(f">>>> 成功恢复进度: 已进行 {total_games} 局，进化触发 {evolution_trigger_count} 次")
         else:
             agent.load_state_dict(checkpoint)
-        print(f">>>> 已从 {current_save_path} 加载权重")
-    elif os.path.exists(config["p1_path"]):
-        agent.load_state_dict(torch.load(config["p1_path"], map_location=config["device"]))
+    elif config["p1_path"] and os.path.exists(config["p1_path"]):
+        # 如果不是 resume，但指定了起点模型，则从该模型开始
+        checkpoint = torch.load(config["p1_path"], map_location=config["device"])
+        state = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
+        agent.load_state_dict(state)
+        print(f"检测到起点模型，Agent 加载自: {config['p1_path']}")
+    else:
+        print("未检测到存档或起点模型，Agent 将从随机初始化开始。")
 
-    # --- 2. 恢复考官和对手池 ---
-    if os.path.exists(opponent_model_path):
-        opp_checkpoint = torch.load(opponent_model_path, map_location=config["device"])
-        opp_state = opp_checkpoint["model_state_dict"] if isinstance(opp_checkpoint,
-                                                                     dict) and "model_state_dict" in opp_checkpoint else opp_checkpoint
-        for opp in opponents:
-            opp.load_state_dict(opp_state)
-            opp.eval()
+    # 2. 对手池初始化
+    opponent_pool_paths = []
+    if os.path.exists(config["external_history_folder"]):
+        ext_files = glob.glob(os.path.join(config["external_history_folder"], "*.pth"))
+        opponent_pool_paths.extend([os.path.abspath(f) for f in ext_files])
 
-        history_files = glob.glob(os.path.join(current_run_dir, "evolution_v*.pth"))
-        history_files.sort(key=lambda x: int(os.path.basename(x).replace('evolution_v', '').replace('.pth', '')))
-        for h_path in history_files:
-            opponent_pool_paths.append(h_path)
-            q_scores.append(1.0)
-        evolution_count = len(history_files)
+    history_files = glob.glob(os.path.join(current_run_dir, "evolution_v*.pth"))
+    history_files.sort(key=lambda x: int(os.path.basename(x).replace('evolution_v', '').replace('.pth', '')))
+    opponent_pool_paths.extend([os.path.abspath(p) for p in history_files])
 
-    # --- 3. TensorBoard 路径处理 (防乱线) ---
-    log_name = f"vs_fixed_{timestamp}" + ("_resume" if is_resume else "")
-    writer = SummaryWriter(f"runs/{log_name}")
+    q_scores = [1.0] * len(opponent_pool_paths)
+    evolution_count = len(history_files)
 
+    def load_opponent_to_env(env_idx, path):
+        if not os.path.exists(path):
+            return
+        opp_ckpt = torch.load(path, map_location=config["device"])
+        opp_state = opp_ckpt["model_state_dict"] if isinstance(opp_ckpt,
+                                                               dict) and "model_state_dict" in opp_ckpt else opp_ckpt
+        opponents[env_idx].load_state_dict(opp_state)
+        opponents[env_idx].eval()
+        for param in opponents[env_idx].parameters(): param.requires_grad = False
+
+    # --- 初始考官设置逻辑修改 ---
+    if not os.path.exists(opponent_model_path):
+        # 如果当前训练目录没有考官，优先使用 p2_path，其次 p1_path，最后用当前 agent 权重
+        initial_opp_path = config["p2_path"] if config["p2_path"] else config["p1_path"]
+        if initial_opp_path and os.path.exists(initial_opp_path):
+            torch.save(torch.load(initial_opp_path, map_location=config["device"]), opponent_model_path)
+        else:
+            torch.save(agent.state_dict(), opponent_model_path)
+
+    for i in range(config["num_envs"]):
+        load_opponent_to_env(i, opponent_model_path)
+    writer = SummaryWriter(f"runs/vs_fixed_{timestamp}" + ("_resume" if is_resume else ""))
     optimizer = optim.Adam(agent.parameters(), lr=config["lr"])
     current_opp_paths = [opponent_model_path for _ in range(config["num_envs"])]
     current_opp_indices = [-1 for _ in range(config["num_envs"])]
 
-    # 缓冲区初始化
-    obs_buf = torch.zeros((config["num_steps"], config["num_envs"], 48)).to(config["device"])
+    obs_buf = torch.zeros((config["num_steps"], config["num_envs"], 52)).to(config["device"])
     act_buf = torch.zeros((config["num_steps"], config["num_envs"])).to(config["device"])
     logp_buf = torch.zeros((config["num_steps"], config["num_envs"])).to(config["device"])
     rew_buf = torch.zeros((config["num_steps"], config["num_envs"])).to(config["device"])
@@ -142,7 +166,7 @@ def train():
     obs_p1, infos = envs.reset()
     p2_deques = [deque(maxlen=4) for _ in range(config["num_envs"])]
     for i in range(config["num_envs"]):
-        init_p2 = infos["p2_raw_obs"][i] if "p2_raw_obs" in infos else np.zeros(12)
+        init_p2 = infos["p2_raw_obs"][i] if "p2_raw_obs" in infos else np.zeros(13)
         for _ in range(4): p2_deques[i].append(init_p2)
     obs_p2 = np.array([np.concatenate(list(d), axis=0) for d in p2_deques])
     side_swapped = np.random.rand(config["num_envs"]) > 0.5
@@ -151,8 +175,8 @@ def train():
         agent.eval()
         for step in range(config["num_steps"]):
             global_step += config["num_envs"]
-            t_obs_agent = torch.zeros((config["num_envs"], 48)).to(config["device"])
-            t_obs_opp = torch.zeros((config["num_envs"], 48)).to(config["device"])
+            t_obs_agent = torch.zeros((config["num_envs"], 52)).to(config["device"])
+            t_obs_opp = torch.zeros((config["num_envs"], 52)).to(config["device"])
 
             for i in range(config["num_envs"]):
                 if not side_swapped[i]:
@@ -169,10 +193,8 @@ def train():
 
             env_actions = np.zeros((config["num_envs"], 2), dtype=np.int32)
             for i in range(config["num_envs"]):
-                if not side_swapped[i]:
-                    env_actions[i] = [actions_agent[i].item(), actions_opp[i].item()]
-                else:
-                    env_actions[i] = [actions_opp[i].item(), actions_agent[i].item()]
+                env_actions[i] = [actions_agent[i].item(), actions_opp[i].item()] if not side_swapped[i] else [
+                    actions_opp[i].item(), actions_agent[i].item()]
 
             n_obs_p1, reward, term, trunc, infos = envs.step(env_actions)
 
@@ -183,32 +205,37 @@ def train():
                     total_games += 1
                     is_agent_win = 1 if (not side_swapped[i] and infos["p1_score"][i] > infos["p2_score"][i]) or \
                                         (side_swapped[i] and infos["p2_score"][i] > infos["p1_score"][i]) else 0
-                    agent_wins += is_agent_win
-                    recent_wins.append(is_agent_win)
 
-                    # 质量分逻辑
+                    # --- 修改点：判断是否超过30把的观察期 ---
+                    if games_after_evolution >= WARMUP_GAMES:
+                        agent_wins += is_agent_win
+                        recent_wins.append(is_agent_win)
+
+                    games_after_evolution += 1
+
+                    # 质量分更新
                     if current_opp_indices[i] != -1 and is_agent_win:
                         qs = np.array(q_scores)
-                        probs = np.exp(qs - np.max(qs)) / np.sum(np.exp(qs - np.max(qs)))
+                        raw_probs = np.exp(qs - np.max(qs)) / np.sum(np.exp(qs - np.max(qs)))
+                        actual_prob = (1 - config["alpha_sampling"]) * raw_probs[current_opp_indices[i]] + (
+                                    config["alpha_sampling"] / len(opponent_pool_paths))
                         q_scores[current_opp_indices[i]] -= config["openai_eta"] / (
-                                    len(opponent_pool_paths) * probs[current_opp_indices[i]])
+                                    len(opponent_pool_paths) * actual_prob)
 
+                    # 采样新对手
                     if len(opponent_pool_paths) > 0 and random.random() < config["historical_ratio"]:
                         qs = np.array(q_scores)
-                        probs = np.exp(qs - np.max(qs)) / np.sum(np.exp(qs - np.max(qs)))
-                        idx = np.random.choice(len(opponent_pool_paths), p=probs)
+                        softmax_probs = np.exp(qs - np.max(qs)) / np.sum(np.exp(qs - np.max(qs)))
+                        final_probs = (1 - config["alpha_sampling"]) * softmax_probs + config["alpha_sampling"] * (
+                                    np.ones_like(qs) / len(qs))
+                        idx = np.random.choice(len(opponent_pool_paths), p=final_probs)
                         path, current_opp_indices[i] = opponent_pool_paths[idx], idx
                     else:
                         path, current_opp_indices[i] = opponent_model_path, -1
 
-                    opponents[i].load_state_dict(torch.load(path, map_location=config["device"])[
-                                                     "model_state_dict"] if "model_state_dict" in torch.load(path,
-                                                                                                             map_location=
-                                                                                                             config[
-                                                                                                                 "device"]) else torch.load(
-                        path, map_location=config["device"]))
-                    opponents[i].eval()
+                    load_opponent_to_env(i, path)
                     current_opp_paths[i], side_swapped[i] = path, np.random.rand() > 0.5
+
                     if "episode_steps" in infos: writer.add_scalar("Game/Episode_Steps", infos["episode_steps"][i],
                                                                    total_games)
                     p2_deques[i].clear()
@@ -221,13 +248,13 @@ def train():
             done_buf[step] = torch.from_numpy((term | trunc).astype(np.float32)).to(config["device"])
             obs_p1, obs_p2 = n_obs_p1, np.array([np.concatenate(list(d), axis=0) for d in p2_deques])
 
-        # PPO 更新逻辑 (保持不变)
+        # PPO 更新
         with torch.no_grad():
-            t_next_obs = torch.zeros((config["num_envs"], 48)).to(config["device"])
+            t_next_obs = torch.zeros((config["num_envs"], 52)).to(config["device"])
             for i in range(config["num_envs"]): t_next_obs[i] = torch.from_numpy(
                 obs_p2[i] if side_swapped[i] else obs_p1[i]).float()
             _, _, _, next_val = agent.get_action_and_value(t_next_obs)
-            adv = torch.zeros_like(rew_buf).to(config["device"])
+            adv = torch.zeros_like(rew_buf).to(config["device"]);
             lastgae = 0
             for t in reversed(range(config["num_steps"])):
                 nt = 1.0 - done_buf[t]
@@ -237,7 +264,7 @@ def train():
             ret = adv + val_buf
 
         agent.train()
-        b_obs, b_logp, b_act, b_adv, b_ret = obs_buf.reshape(-1, 48), logp_buf.reshape(-1), act_buf.reshape(
+        b_obs, b_logp, b_act, b_adv, b_ret = obs_buf.reshape(-1, 52), logp_buf.reshape(-1), act_buf.reshape(
             -1), adv.reshape(-1), ret.reshape(-1)
         indices = np.arange(config["num_steps"] * config["num_envs"])
         for _ in range(config["update_epochs"]):
@@ -256,21 +283,23 @@ def train():
                 optimizer.step()
 
         # 监控记录
-        total_agent_win_rate = agent_wins / total_games if total_games > 0 else 0
-        writer.add_scalar("Train/Total_Win_Rate", total_agent_win_rate, global_step)
-        for idx, score in enumerate(q_scores): writer.add_scalar(f"Opponent_Scores/v{idx + 1}", score, global_step)
+        current_window_win_rate = sum(recent_wins) / len(recent_wins) if len(recent_wins) > 0 else 0
+        writer.add_scalar("Train/Total_Win_Rate", current_window_win_rate, global_step)
 
-        # 核心逻辑：持久化保存包含对局数的状态字典
+        for idx, score in enumerate(q_scores):
+            opp_name = os.path.basename(opponent_pool_paths[idx])
+            writer.add_scalar(f"Opponent_Scores/{opp_name}", score, global_step)
+
         checkpoint_data = {
             "model_state_dict": agent.state_dict(),
-            "total_games": total_games,
-            "agent_wins": agent_wins,
-            "evolution_trigger_count": evolution_trigger_count
+            "total_games": total_games, "agent_wins": agent_wins, "evolution_trigger_count": evolution_trigger_count
         }
 
-        if total_games >= config["min_games_to_replace"] and total_agent_win_rate >= config["auto_replace_threshold"]:
+        # 进化逻辑
+        if len(recent_wins) >= config["win_rate_window"] and current_window_win_rate >= config[
+            "auto_replace_threshold"]:
             evolution_trigger_count += 1
-            print(f"\n[进化触发] 第 {evolution_trigger_count} 次胜率达标！")
+            print(f"\n[进化触发] 窗口胜率达标 ({current_window_win_rate:.2%})，替换考官！")
             torch.save(checkpoint_data, opponent_model_path)
             if evolution_trigger_count % config["save_every_n_evolutions"] == 0:
                 evolution_count += 1
@@ -278,14 +307,19 @@ def train():
                 torch.save(checkpoint_data, new_v_path)
                 opponent_pool_paths.append(new_v_path)
                 q_scores.append(max(q_scores) if q_scores else 1.0)
-            # 重置当前进化周期的计数，但不影响已存入文件的总量
+
+            # --- 关键修改点：在触发进化后清空数据并重置对局计数 ---
+            recent_wins.clear();
             total_games, agent_wins = 0, 0
-            recent_wins.clear()
+            games_after_evolution = 0
 
         torch.save(checkpoint_data, current_save_path)
+
         q_info = f" | 池分均值: {np.mean(q_scores):.2f}" if q_scores else ""
+        opp_0_name = os.path.basename(current_opp_paths[0]) if os.path.exists(
+            current_opp_paths[0]) else "Random_Whiteboard"
         print(
-            f"步数: {global_step:7d} | 当前周期局数: {total_games:4d} | 胜率: {total_agent_win_rate:.2%}{q_info} | 对手: {os.path.basename(current_opp_paths[0])}")
+            f"步数: {global_step:7d} | 周期局数: {total_games:4d} | 窗口胜率: {current_window_win_rate:.2%}{q_info} | Env0对手: {opp_0_name}")
 
     envs.close();
     writer.close()
