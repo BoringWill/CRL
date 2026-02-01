@@ -9,9 +9,9 @@ from slime_env import SlimeSelfPlayEnv, FrameStack
 # --- 配置 ---
 CONFIG = {
     # 模型 A（主模型 / P1 默认模型）
-    "model_path_a": "最强模型集/11.pth",
+    "model_path_a": "最强模型集/gpu_slime_model.pth",
     # 模型 B（PK 模式下的对手模型）
-    "model_path_b": "模型集_opponent/train_20260128-172434/evolution_v13.pth",
+    "model_path_b": "最强模型集/gpu_slime_model.pth",
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 }
 
