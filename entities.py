@@ -21,6 +21,7 @@ class Entity:
             self.vy = 0
 
     def draw_slime(self, screen):
+        # 视觉上依然保持半圆绘制
         pygame.draw.circle(screen, self.color, (int(self.x), int(self.y)), self.radius)
         pygame.draw.rect(screen, COLOR_BG, (self.x - self.radius, self.y, self.radius * 2, self.radius))
 
@@ -47,31 +48,29 @@ class SlimeBall(Entity):
         dy = self.y - slime.y
         dist = math.sqrt(dx ** 2 + dy ** 2)
 
-        if dist < (self.radius + slime.radius) and self.y < slime.y:
+        # 修改核心：判定范围改为整个圆，不再限制 self.y < slime.y
+        if dist < (self.radius + slime.radius):
+            # 计算碰撞法线角度
             angle = math.atan2(dy, dx)
 
-            # --- 核心修改：让物理反馈更细腻 ---
-            # 1. 基础反弹力降低，让 AI 有机会“卸力”或“吊球”
-            base_bounce = 2.5 * self.speed_multiplier
+            # 统一的反弹逻辑：基于碰撞点角度
+            # 如果球在玩家下方(dy > 0)，sin(angle)为正，vy自然向下(扣球)
+            # 如果球在玩家上方(dy < 0)，sin(angle)为负，vy自然向上(垫球)
+            speed = 15.0 * self.speed_multiplier
 
-            # 2. 玩家速度贡献降低 (从2.0降到1.0)，防止一碰就到最大速度
-            player_impact_x = slime.vx * 1.0
+            # 玩家速度对球的贡献
+            self.vx = math.cos(angle) * speed + (slime.vx * 0.5)
+            self.vy = math.sin(angle) * speed + (slime.vy * 0.5)
 
-            # 3. 计算新的速度：X由撞击点和玩家移动共同决定，Y主要由撞击位置决定
-            self.vx = math.cos(angle) * base_bounce * 2.0 + player_impact_x
-            # 给予一个向上的基础升力，角度越正上方，升力越大
-            self.vy = math.sin(angle) * base_bounce - (6.5 * self.speed_multiplier) + (slime.vy * 0.5)
-
+            # 速度上限限制
             current_speed = math.sqrt(self.vx ** 2 + self.vy ** 2)
             dynamic_max_speed = BALL_MAX_SPEED * self.speed_multiplier
-
-            # 限制最高速
             if current_speed > dynamic_max_speed:
                 scale = dynamic_max_speed / current_speed
                 self.vx *= scale
                 self.vy *= scale
 
-            # 防止穿透
+            # --- 防止穿透：硬位移修正 ---
             overlap = (self.radius + slime.radius) - dist
             self.x += math.cos(angle) * overlap
             self.y += math.sin(angle) * overlap
@@ -79,7 +78,6 @@ class SlimeBall(Entity):
         return False
 
     def check_net_collision(self):
-        # 保持原有的网碰撞逻辑
         if abs(self.x - NET_X) < (self.radius + NET_WIDTH / 2) and self.y > NET_Y:
             if self.x < NET_X:
                 self.x = NET_X - NET_WIDTH / 2 - self.radius

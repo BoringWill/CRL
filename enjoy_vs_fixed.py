@@ -7,13 +7,13 @@ from collections import deque
 from slime_env import SlimeSelfPlayEnv, FrameStack
 
 # --- 配置 ---
-NEW_MODEL_PATH = "最强模型集/evolution_v6.pth"
+NEW_MODEL_PATH = "最强模型集/1.pth"
 HISTORY_FOLDER = "最强模型集"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 测试参数
 NUM_ENVS = 32
-GAMES_PER_OPPONENT = 20  # 建议稍微多打几局，结果更准
+GAMES_PER_OPPONENT = 5  # 建议稍微多打几局，结果更准
 
 
 # --- 模型结构 ---

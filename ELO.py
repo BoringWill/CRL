@@ -10,10 +10,10 @@ from slime_env import SlimeSelfPlayEnv, FrameStack
 
 # --- 配置 ---
 CONFIG = {
-    "model_dir": "最强模型集", #C:/Users/asus/Desktop/CRL_GPU/模型集_selfplay_gpu/run_20260127-224621
-    "games_per_match": 20,  # 每对选手打20局以获得更稳定的胜率
+    "model_dir": "模型集_opponent/train_20260202-021904", #C:/Users/asus/Desktop/CRL_GPU/模型集_selfplay_gpu/run_20260127-224621
+    "games_per_match": 10,  # 每对选手打20局以获得更稳定的胜率
     "k_factor": 32,  # ELO K因子
-    "max_workers": 8,  # 建议设为你的核心数
+    "max_workers": 10,  # 建议设为你的核心数
     "temperature": 0.8  # 采样温度，0.8 兼顾了实力和随机变招
 }
 
