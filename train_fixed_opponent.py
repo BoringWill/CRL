@@ -32,7 +32,7 @@ config = {
     "vf_coef": 0.5,
     "max_grad_norm": 0.5,
     "openai_eta": 0.1,
-    "historical_ratio": 0.3,
+    "historical_ratio": 0.4,
     "alpha_sampling": 0.1,
     "save_every_n_evolutions": 5,
 }
@@ -93,7 +93,7 @@ def train():
     agent_wins = 0
     recent_wins = deque(maxlen=config["win_rate_window"])
     games_after_evolution = 0
-    WARMUP_GAMES = 30
+    WARMUP_GAMES = 20
 
     # 1. Agent 权重加载
     if os.path.exists(current_save_path):
