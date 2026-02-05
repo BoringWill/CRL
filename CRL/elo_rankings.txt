@@ -1,0 +1,12 @@
+Slime Volleyball Elo Rankings
+------------------------------
+1. best.pth: 1295.7
+2. evolution_v2.pth: 1295.6
+3. hard_1.pth: 1260.7
+4. hard_3.pth: 1256.8
+5. hard_2.pth: 1196.2
+6. normal_3.pth: 1193.6
+7. normal_2.pth: 1158.7
+8. normal_1.pth: 1149.7
+9. fw_1.pth: 1097.8
+10. fw_2.pth: 1095.2
