@@ -1,24 +1,28 @@
 # constants.py
 
 # 窗口设置
-WIDTH, HEIGHT = 1000, 500
+WIDTH, HEIGHT = 1200, 600
 FPS = 60
 
 # --- 物理参数优化 ---
-GRAVITY = 0.4       # 低重力，让球弹得更高更久
-PLAYER_SPEED = 8    # 玩家左右移动速度
-JUMP_POWER = -9       # 玩家跳跃力度
-BALL_MAX_SPEED = 13    # 限制最高球速，防止太快
+GRAVITY = 0.45          # 重力
+BALL_MAX_SPEED = 15    # 最高球速
+JUMP_POWER = -10        # 固定跳跃力度 (恢复原值)
+
+# [保留] 玩家移动物理参数 (实现水平惯性)
+PLAYER_MAX_SPEED = 10  # 最大水平奔跑速度
+PLAYER_ACCEL = 2    # 加速度：起步感
+PLAYER_FRICTION = 0.4 # 摩擦力：滑行感
 
 # --- 尺寸设置 ---
-BALL_RADIUS = 9        # <--- 在这里修改球的大小 (圆形半径)
-SLIME_RADIUS = 27       # 史莱姆的大小 (保持半圆形状)
+BALL_RADIUS = 9
+SLIME_RADIUS = 27
 
 # --- 网的设置 ---
 NET_WIDTH = 10
-NET_HEIGHT = 80        # 网高
+NET_HEIGHT = 80
 NET_X = WIDTH // 2
-NET_Y = HEIGHT - 50 - NET_HEIGHT # 网的顶部 Y 坐标
+NET_Y = HEIGHT - 50 - NET_HEIGHT
 
 # --- 颜色 ---
 COLOR_P1 = (255, 100, 100)

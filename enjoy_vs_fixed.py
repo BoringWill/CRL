@@ -7,13 +7,13 @@ from collections import deque
 from slime_env import SlimeSelfPlayEnv, FrameStack
 
 # --- 配置 ---
-NEW_MODEL_PATH = "最强模型集/1.pth"
-HISTORY_FOLDER = "最强模型集"
+NEW_MODEL_PATH = "最强模型集/best_.pth"
+HISTORY_FOLDER = "测试"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 测试参数
 NUM_ENVS = 32
-GAMES_PER_OPPONENT = 5  # 建议稍微多打几局，结果更准
+GAMES_PER_OPPONENT = 32  # 建议稍微多打几局，结果更准 建议多局数少
 
 
 # --- 模型结构 ---
@@ -50,11 +50,13 @@ def make_env():
 def run_vector_battle(envs, agent_new, agent_hist, num_total_games):
     new_model_wins = 0
     games_finished = 0
+    # --- 新增：得分统计 ---
+    total_score_new = 0
+    total_score_hist = 0
 
     obs_p1, infos = envs.reset()
     p2_deques = [deque(maxlen=4) for _ in range(NUM_ENVS)]
 
-    # --- 关键修改：初始帧同步，由 12 改为 13 ---
     p2_raw_initial = infos.get("p2_raw_obs")
     for i in range(NUM_ENVS):
         init_p2 = p2_raw_initial[i] if p2_raw_initial is not None else np.zeros(13)
@@ -65,15 +67,12 @@ def run_vector_battle(envs, agent_new, agent_hist, num_total_games):
     while games_finished < num_total_games:
         obs_p2 = np.array([np.concatenate(list(d)) for d in p2_deques])
 
-        # 分配观测值
         t_obs_new = np.where(side_swapped[:, None], obs_p2, obs_p1)
         t_obs_hist = np.where(side_swapped[:, None], obs_p1, obs_p2)
 
-        # 预测动作
         act_new = agent_new.get_actions(t_obs_new, DEVICE)
         act_hist = agent_hist.get_actions(t_obs_hist, DEVICE)
 
-        # 组合动作
         env_actions = np.zeros((NUM_ENVS, 2), dtype=np.int32)
         for i in range(NUM_ENVS):
             if not side_swapped[i]:
@@ -87,16 +86,21 @@ def run_vector_battle(envs, agent_new, agent_hist, num_total_games):
         for i in range(NUM_ENVS):
             if terms[i] or truncs[i]:
                 games_finished += 1
-                p1_won = infos["p1_score"][i] > infos["p2_score"][i]
-                p2_won = infos["p2_score"][i] > infos["p1_score"][i]
+                s1 = infos["p1_score"][i]
+                s2 = infos["p2_score"][i]
 
-                if (not side_swapped[i] and p1_won) or (side_swapped[i] and p2_won):
-                    new_model_wins += 1
+                # --- 修改：根据 side_swapped 统计得分和胜场 ---
+                if not side_swapped[i]:
+                    total_score_new += s1
+                    total_score_hist += s2
+                    if s1 > s2: new_model_wins += 1
+                else:
+                    total_score_new += s2
+                    total_score_hist += s1
+                    if s2 > s1: new_model_wins += 1
 
-                # 重置该环境的 P2 队列
                 side_swapped[i] = np.random.rand() > 0.5
                 p2_deques[i].clear()
-                # --- 关键修改：重置时维度由 12 改为 13 ---
                 res_p2 = p2_raw_batch[i] if p2_raw_batch is not None else np.zeros(13)
                 for _ in range(4): p2_deques[i].append(res_p2)
 
@@ -105,7 +109,8 @@ def run_vector_battle(envs, agent_new, agent_hist, num_total_games):
                 if p2_raw_batch is not None:
                     p2_deques[i].append(p2_raw_batch[i])
 
-    return new_model_wins
+    # --- 修改：返回包含比分的结果 ---
+    return new_model_wins, total_score_new, total_score_hist
 
 
 def safe_load(agent, path):
@@ -131,7 +136,6 @@ def main():
     print(f"正在初始化 {NUM_ENVS} 个并行对战环境...")
     envs = gym.vector.AsyncVectorEnv([make_env() for _ in range(NUM_ENVS)])
 
-    # 1. 加载新模型
     agent_new = Agent().to(DEVICE)
     success, info = safe_load(agent_new, NEW_MODEL_PATH)
     if not success:
@@ -139,18 +143,16 @@ def main():
         return
     print(f"✅ 新模型已准备就绪: {os.path.basename(NEW_MODEL_PATH)}")
 
-    # 2. 扫描历史文件夹
     if not os.path.exists(HISTORY_FOLDER):
         print(f"❌ 找不到文件夹: {HISTORY_FOLDER}")
         return
 
-    # 修正：同时兼容大小写后缀
     history_files = [f for f in os.listdir(HISTORY_FOLDER) if f.lower().endswith('.pth')]
     history_files.sort()
 
-    print("=" * 70)
+    print("=" * 85)
     print(f"开始历史挑战赛 | 总选手: {len(history_files)} | 每场局数: {GAMES_PER_OPPONENT}")
-    print("=" * 70)
+    print("=" * 85)
 
     results = []
     for hist_file in history_files:
@@ -166,19 +168,21 @@ def main():
         agent_hist.eval()
         agent_new.eval()
 
-        wins = run_vector_battle(envs, agent_new, agent_hist, GAMES_PER_OPPONENT)
+        # --- 修改：接收并打印比分 ---
+        wins, score_new, score_hist = run_vector_battle(envs, agent_new, agent_hist, GAMES_PER_OPPONENT)
         win_rate = (wins / GAMES_PER_OPPONENT) * 100
-        results.append((hist_file, win_rate))
-        print(f"胜率: {win_rate:>6.2f}%")
+        score_str = f"{int(score_new)}:{int(score_hist)}"
+        results.append((hist_file, win_rate, score_str))
+        print(f"胜率: {win_rate:>6.2f}% | 比分: {score_str}")
 
-    # 3. 结果汇总
-    print("\n" + "=" * 70)
-    print(f"{'历史版本文件名':<35} | {'胜率':<8} | {'结论'}")
-    print("-" * 70)
-    for name, rate in results:
+    # --- 修改：最终汇总打印 ---
+    print("\n" + "=" * 85)
+    print(f"{'历史版本文件名':<35} | {'胜率':<8} | {'总比分':<12} | {'结论'}")
+    print("-" * 85)
+    for name, rate, s_ratio in results:
         status = "🟢 胜出" if rate > 50 else "🔴 落败"
-        print(f"{name:<35} | {rate:>7.1f}% | {status}")
-    print("=" * 70)
+        print(f"{name:<35} | {rate:>7.1f}% | {s_ratio:<12} | {status}")
+    print("=" * 85)
 
     envs.close()
 

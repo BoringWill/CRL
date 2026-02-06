@@ -12,7 +12,6 @@ class SlimeSelfPlayEnv(gym.Env):
         super().__init__()
         self.render_mode = render_mode
         self.action_space = spaces.Discrete(4)
-        # 13维特征
         self.observation_space = spaces.Box(low=-1, high=1, shape=(13,), dtype=np.float32)
 
         self.screen = None
@@ -21,18 +20,17 @@ class SlimeSelfPlayEnv(gym.Env):
 
         self.p1_score = 0
         self.p2_score = 0
-        self.win_score = 100  # 改回 10 分获胜
+        self.win_score = 10
         self.total_rounds = 0
         self.global_step_in_episode = 0
         self.ball_speed_multiplier = 1.0
 
-        # --- 设定：每一小球的最大步数 ---
-        self.max_steps_per_point = 2500
+        # 步数限制逻辑
+        self.max_steps_per_point = 3000
+        self.max_total_steps = self.max_steps_per_point * self.win_score
         self.steps_in_current_point = 0
 
-        # --- 状态变量 ---
         self.last_touched_by = None
-        self.collision_cooldown = 0
         self.is_serving = False
         self.serve_timer = 0
         self.server_id = 1
@@ -71,24 +69,31 @@ class SlimeSelfPlayEnv(gym.Env):
 
     def _internal_point_reset(self, full_reset=False):
         self.last_touched_by = None
-        self.collision_cooldown = 0
         self.steps_in_current_point = 0
 
         if full_reset:
+            # 【大局重置】：重置所有位置到初始点
             self.p1 = Entity(200, GROUND_Y, SLIME_RADIUS, COLOR_P1)
             self.p2 = Entity(800, GROUND_Y, SLIME_RADIUS, COLOR_P2)
         else:
+            # 【小局重置】：只重置速度，不重置位置（满足你的需求）
             self.p1.vx, self.p1.vy = 0, 0
             self.p2.vx, self.p2.vy = 0, 0
+            # 下面这两行被注释掉了，因此玩家位置不会被重置
+            # self.p1.x, self.p1.y = 200, GROUND_Y - SLIME_RADIUS
+            # self.p2.x, self.p2.y = 800, GROUND_Y - SLIME_RADIUS
 
+        # 球始终重置
         self.ball = SlimeBall(0, 0, BALL_RADIUS, COLOR_BALL)
         self.ball.speed_multiplier = self.ball_speed_multiplier
         self.is_serving = True
         self.serve_timer = 45
 
     def _restrict_player_area(self):
-        p1_min_x, p1_max_x = self.p1.radius, NET_X - NET_WIDTH / 2 - self.p1.radius
-        p2_min_x, p2_max_x = NET_X + NET_WIDTH / 2 + self.p2.radius, WIDTH - self.p2.radius
+        p1_min_x = self.p1.radius
+        p1_max_x = NET_X - NET_WIDTH / 2 - self.p1.radius
+        p2_min_x = NET_X + NET_WIDTH / 2 + self.p2.radius
+        p2_max_x = WIDTH - self.p2.radius
 
         FORBIDDEN_ZONE_WIDTH = 100
         if self.is_serving:
@@ -101,19 +106,27 @@ class SlimeSelfPlayEnv(gym.Env):
         self.p2.x = np.clip(self.p2.x, p2_min_x, p2_max_x)
 
     def _apply_player_actions(self, action_p1, action_p2):
-        self.p1.vx = 0
-        if action_p1 == 1:
-            self.p1.vx = -PLAYER_SPEED
-        elif action_p1 == 2:
-            self.p1.vx = PLAYER_SPEED
-        if action_p1 == 3 and self.p1.vy == 0: self.p1.vy = JUMP_POWER
+        def process_physics(entity, action, is_p1):
+            if is_p1:
+                move_left = (action == 1)
+                move_right = (action == 2)
+            else:
+                move_left = (action == 2)
+                move_right = (action == 1)
 
-        self.p2.vx = 0
-        if action_p2 == 1:
-            self.p2.vx = PLAYER_SPEED
-        elif action_p2 == 2:
-            self.p2.vx = -PLAYER_SPEED
-        if action_p2 == 3 and self.p2.vy == 0: self.p2.vy = JUMP_POWER
+            if move_left:
+                entity.vx -= PLAYER_ACCEL
+            elif move_right:
+                entity.vx += PLAYER_ACCEL
+            else:
+                entity.vx *= PLAYER_FRICTION
+                if abs(entity.vx) < 0.1: entity.vx = 0
+            entity.vx = np.clip(entity.vx, -PLAYER_MAX_SPEED, PLAYER_MAX_SPEED)
+            if action == 3 and (entity.y + entity.radius >= GROUND_Y - 2.0) and entity.vy == 0:
+                entity.vy = JUMP_POWER
+
+        process_physics(self.p1, action_p1, True)
+        process_physics(self.p2, action_p2, False)
 
     def step(self, actions):
         action_p1, action_p2 = actions
@@ -124,13 +137,20 @@ class SlimeSelfPlayEnv(gym.Env):
         terminated = False
         truncated = False
 
-        # --- 核心修改：每一小球超时双加分 ---
-        if self.steps_in_current_point >= self.max_steps_per_point:
-            self.p1_score += 1
-            self.p2_score += 1
-            # 这种情况不触发常规得分奖励逻辑，进入 score_change
-            return self._handle_score_change(0.0)
+        # --- 全局步数限制 ---
+        if self.global_step_in_episode >= self.max_total_steps:
+            if self.p1_score == self.p2_score:
+                truncated = True
+            else:
+                terminated = True
+            return self._return_step_data(0.0, terminated, truncated)
 
+        # --- 小局步数限制 ---
+        if self.steps_in_current_point >= self.max_steps_per_point:
+            self._internal_point_reset(full_reset=False)
+            return self._return_step_data(0.0, False, False)
+
+        # 物理更新
         self._apply_player_actions(action_p1, action_p2)
         self.p1.apply_physics()
         self.p2.apply_physics()
@@ -144,41 +164,46 @@ class SlimeSelfPlayEnv(gym.Env):
                 self.is_serving = False
                 self.ball.vy = 2.0
         else:
-            self.ball.update()
-            self._custom_net_collision()
+            SUB_STEPS = 4
+            for _ in range(SUB_STEPS):
+                self.ball.x += self.ball.vx / SUB_STEPS
+                self.ball.y += self.ball.vy / SUB_STEPS
+                if self.ball.y + self.ball.radius < GROUND_Y:
+                    self.ball.vy += GRAVITY / SUB_STEPS
+                if self.ball.check_player_collision(self.p1):
+                    self.last_touched_by = 1
+                    self.ball.check_net_collision()
+                if self.ball.check_player_collision(self.p2):
+                    self.last_touched_by = 2
+                    self.ball.check_net_collision()
+                self.ball.check_net_collision()
 
+        # --- 判分逻辑 (已修复分数跳变 BUG) ---
         if not self.is_serving:
-            if self.collision_cooldown > 0:
-                self.collision_cooldown -= 1
-            else:
-                for idx, p in enumerate([self.p1, self.p2], 1):
-                    dist_sq = (self.ball.x - p.x) ** 2 + (self.ball.y - p.y) ** 2
-                    if dist_sq <= (self.ball.radius + p.radius) ** 2:
-                        self.ball.check_player_collision(p)
-                        self.last_touched_by = idx
-                        self.collision_cooldown = 6
-                        break
-
             hit_wall_left = self.ball.x <= self.ball.radius
             hit_wall_right = self.ball.x >= WIDTH - self.ball.radius
             hit_ground = (self.ball.y >= GROUND_Y - self.ball.radius)
 
             if hit_wall_left or hit_wall_right or hit_ground:
+                # 逻辑简化：无论谁最后碰到球，只要球出界/落地，该得分的一方就得分
+
                 if hit_wall_left:
-                    if self.last_touched_by == 1:
-                        reward_p1, self.p2_score = -2.0, self.p2_score + 1
-                    else:
-                        reward_p1, self.p1_score = 2.0, self.p1_score + 1
+                    # 球击中左墙（P1后方），P1输，P2得1分
+                    reward_p1 = -2.0
+                    self.p2_score += 1
                 elif hit_wall_right:
-                    if self.last_touched_by == 2:
-                        reward_p1, self.p1_score = 2.0, self.p1_score + 1
-                    else:
-                        reward_p1, self.p2_score = -2.0, self.p2_score + 1
+                    # 球击中右墙（P2后方），P2输，P1得1分
+                    reward_p1 = 2.0
+                    self.p1_score += 1
                 elif hit_ground:
                     if self.ball.x < WIDTH / 2:
-                        reward_p1, self.p2_score = -2.0, self.p2_score + 1
+                        # 球落在左侧（P1侧），P1输，P2得1分
+                        reward_p1 = -2.0
+                        self.p2_score += 1
                     else:
-                        reward_p1, self.p1_score = 2.0, self.p1_score + 1
+                        # 球落在右侧（P2侧），P2输，P1得1分
+                        reward_p1 = 2.0
+                        self.p1_score += 1
 
                 return self._handle_score_change(reward_p1)
 
@@ -187,52 +212,29 @@ class SlimeSelfPlayEnv(gym.Env):
     def _handle_score_change(self, reward_p1):
         terminated = False
         self.total_rounds += 1
-        self.server_id = 3 - self.server_id
+        self.server_id = 3 - self.server_id  # 交换发球权
 
-        # 检查是否触及 10 分上限
         p1_reaches = self.p1_score >= self.win_score
         p2_reaches = self.p2_score >= self.win_score
 
         if p1_reaches or p2_reaches:
             terminated = True
-            # 如果是双方同时触及 10 分（超时导致），强制判定为平局 reward=0
-            if p1_reaches and p2_reaches:
-                reward_p1 = 0.0
         else:
+            # 只有这里调用 False，表示是小局结束，不重置位置
             self._internal_point_reset(full_reset=False)
 
         return self._return_step_data(reward_p1, terminated, False)
 
     def _return_step_data(self, reward_p1, terminated, truncated):
         return (self._get_obs(1), self._get_obs(2), reward_p1, terminated, truncated,
-                {"p2_raw_obs": self._get_obs(2), "p1_score": self.p1_score, "p2_score": self.p2_score})
-
-    def _custom_net_collision(self):
-        b = self.ball
-        nl = NET_X - NET_WIDTH / 2
-        nr = NET_X + NET_WIDTH / 2
-
-        if b.y + b.radius >= NET_Y and b.y - b.vy <= NET_Y:
-            if nl < b.x < nr:
-                b.vy = -abs(b.vy) * 0.8
-                b.y = NET_Y - b.radius
-                return
-
-        if b.y > NET_Y:
-            buffer = 5.0
-            if nl - b.radius < b.x < NET_X:
-                b.vx = -abs(b.vx) * 0.7
-                b.x = nl - b.radius - buffer
-            elif NET_X < b.x < nr + b.radius:
-                b.vx = abs(b.vx) * 0.7
-                b.x = nr + b.radius + buffer
+                {"p1_score": int(self.p1_score), "p2_score": int(self.p2_score)})
 
     def render(self):
         if self.render_mode != "human": return
         if self.screen is None:
             pygame.init()
             self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
-            pygame.display.set_caption("Slime Volleyball Symmetry Mode")
+            pygame.display.set_caption("Slime Volleyball")
             self.font = pygame.font.SysFont("Arial", 36, bold=True)
             self.clock = pygame.time.Clock()
 
@@ -244,10 +246,8 @@ class SlimeSelfPlayEnv(gym.Env):
         self.p1.draw_slime(self.screen)
         self.p2.draw_slime(self.screen)
 
-        score_str = f"{self.p1_score}   -   {self.p2_score}"
-        score_surface = self.font.render(score_str, True, (50, 50, 50))
-        score_rect = score_surface.get_rect(center=(WIDTH // 2, 40))
-        self.screen.blit(score_surface, score_rect)
+        score_surface = self.font.render(f"{self.p1_score}  -  {self.p2_score}", True, (50, 50, 50))
+        self.screen.blit(score_surface, (WIDTH // 2 - 50, 20))
 
         pygame.display.flip()
         self.clock.tick(60)

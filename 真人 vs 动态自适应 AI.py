@@ -8,64 +8,40 @@ import pygame
 from collections import deque
 from slime_env import SlimeSelfPlayEnv
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import Manager
 
 # --- 核心配置 ---
 CONFIG = {
-    "adaptive_model_path": "最强模型集/2.pth",
+    "adaptive_model_path": "最强模型集/best_.pth",
     "opponents_dir": "最强模型集",
     "device": torch.device("cpu"),
-    "init_temp": 1.0,
+    "init_temp": 0.1,
     "min_temp": 0.1,
-    "max_temp": 10.0,
-    "ema_alpha": 0.05,  # 控制温度变化的速率
+    "max_temp": 10,
+    "inertia": 0.05,
     "max_workers": 10,
+    "games_per_opponent": 10,
 }
 
 
 # --- 1. 逻辑组件 ---
 class SmartDifficultyManager:
-    def __init__(self, init_mean=0.0, init_var=1.0):
-        # 统计量
-        self.mean = init_mean
-        self.var = init_var
-        self.count = 100  # 给一点初始样本数防止除以0或波动过大
+    def __init__(self, init_v1_acc=0.0, init_v2_acc=0.0):
+        self.v1_acc = init_v1_acc
+        self.v2_acc = init_v2_acc
         self.current_temp = CONFIG["init_temp"]
 
-    def update(self, v_raw):
-        # --- Z-score 统计更新 (Welford's 算法) ---
-        self.count += 1
-        old_mean = self.mean
-        self.mean += (v_raw - old_mean) / self.count
-        self.var = (self.var * (self.count - 1) + (v_raw - old_mean) * (v_raw - self.mean)) / self.count
-
-        std = np.sqrt(self.var) if self.var > 1e-5 else 1.0
-
-        # 计算 Z-score
-        z_score = (v_raw - self.mean) / std
-
-        # --- 极简二元控制逻辑 ---
-        # 临时变量，用于计算目标方向
-
-        step_size = 1.0 if self.current_temp >= 1.0 else 0.1
-
-        # 2. 确定目标 (基于 0.25 阈值)
-        step_target = self.current_temp
-        if z_score > 0:
-            step_target += step_size
+    def update(self, v1, v2):
+        self.v1_acc += v1
+        self.v2_acc += v2
+        instant_diff = self.v1_acc - self.v2_acc
+        if instant_diff > 0:
+            target_temp = max(CONFIG["min_temp"], CONFIG["init_temp"] - abs(instant_diff) * 0.01)
         else:
-            step_target -= step_size
-
-        # EMA 更新公式
-        # current_temp 会向 step_target 缓慢移动
-        self.current_temp = self.current_temp * (1 - CONFIG["ema_alpha"]) + step_target * CONFIG["ema_alpha"]
-
-        # --- 安全钳制 ---
-        # 必须加这个，否则 temp 变成负数会导致 Softmax 报错
+            target_temp = min(CONFIG["max_temp"], CONFIG["init_temp"] + abs(instant_diff) * 0.01)
+        temp_step = (target_temp - self.current_temp) * CONFIG["inertia"]
+        self.current_temp += temp_step
         self.current_temp = np.clip(self.current_temp, CONFIG["min_temp"], CONFIG["max_temp"])
-
-        # 返回 temp 和 z_score (用于渲染显示)
-        return self.current_temp, z_score
+        return self.current_temp, instant_diff
 
 
 class Agent(nn.Module):
@@ -83,7 +59,8 @@ class Agent(nn.Module):
         with torch.no_grad():
             t_obs = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
             logits = self.actor(t_obs)
-            probs = F.softmax(logits / temp, dim=-1)
+            safe_temp = max(temp, 1e-6)
+            probs = F.softmax(logits / safe_temp, dim=-1)
             return torch.distributions.Categorical(probs).sample().item()
 
 
@@ -94,23 +71,15 @@ def load_weights(model, path):
     return True
 
 
-# --- 2. 核心对战逻辑 ---
-def play_one_match(opp_name, current_state_snapshot, render=False):
+# --- 2. 核心评估函数 (修复了分数跳变逻辑) ---
+def evaluate_opponent(opp_name, render=False):
     render_mode = "human" if render else None
     env = SlimeSelfPlayEnv(render_mode=render_mode)
 
     agent_adaptive = Agent()
     load_weights(agent_adaptive, CONFIG["adaptive_model_path"])
-
     agent_fixed = Agent()
-    opp_path = os.path.join(CONFIG["opponents_dir"], opp_name)
-    load_weights(agent_fixed, opp_path)
-
-    # 恢复状态
-    diff_manager = SmartDifficultyManager(
-        init_mean=current_state_snapshot.get('mean', 0.0),
-        init_var=current_state_snapshot.get('var', 1.0)
-    )
+    load_weights(agent_fixed, os.path.join(CONFIG["opponents_dir"], opp_name))
 
     font = None
     if render:
@@ -119,140 +88,127 @@ def play_one_match(opp_name, current_state_snapshot, render=False):
         except:
             font = pygame.font.Font(None, 24)
 
-    p1_dq, p2_dq = deque(maxlen=4), deque(maxlen=4)
-    raw_obs_p1, _ = env.reset()
-    raw_obs_p2 = env._get_obs(2)
-    for _ in range(4): p1_dq.append(raw_obs_p1); p2_dq.append(raw_obs_p2)
+    total_p1, total_p2 = 0, 0
+    match_v1_all, match_v2_all = [], []
+    wins = 0
 
-    done = False
+    for game_idx in range(CONFIG["games_per_opponent"]):
+        diff_manager = SmartDifficultyManager()
+        p1_dq, p2_dq = deque(maxlen=4), deque(maxlen=4)
 
-    while not done:
-        if render:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit()
-                    return None
+        # 重置环境并获取初始观测
+        raw_obs_p1, _ = env.reset()
+        raw_obs_p2 = env._get_obs(2)
+        for _ in range(4): p1_dq.append(raw_obs_p1); p2_dq.append(raw_obs_p2)
 
-        obs_p1 = np.concatenate(list(p1_dq))
-        obs_p2 = np.concatenate(list(p2_dq))
+        done = False
+        while not done:
+            if render:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT: pygame.quit(); return None
 
-        # 1. 获取 Value
-        current_val = agent_adaptive.get_value(obs_p2)
+            obs_p1, obs_p2 = np.concatenate(list(p1_dq)), np.concatenate(list(p2_dq))
+            v1, v2 = agent_adaptive.get_value(obs_p1), agent_adaptive.get_value(obs_p2)
+            match_v1_all.append(v1)
+            match_v2_all.append(v2)
 
-        # 2. 纯粹的 Z-score 更新逻辑
-        curr_temp, z_val = diff_manager.update(current_val)
+            curr_temp, _ = diff_manager.update(v1, v2)
+            a1 = agent_fixed.get_action(obs_p1, curr_temp)
+            a2 = agent_adaptive.get_action(obs_p2, curr_temp)
 
-        # 3. 采样
-        a1 = agent_fixed.get_action(obs_p1, 0.01)
-        a2 = agent_adaptive.get_action(obs_p2, curr_temp)
+            # 执行动作
+            n_p1, n_p2, _, term, trunc, info = env.step((a1, a2))
+            p1_dq.append(n_p1)
+            p2_dq.append(n_p2)
 
-        n_p1, n_p2, _, term, trunc, _ = env.step((a1, a2))
-        p1_dq.append(n_p1);
-        p2_dq.append(n_p2)
+            if render:
+                env.render()
+                try:
+                    screen = pygame.display.get_surface()
+                    if screen:
+                        # 此处显示总分 + 本局即时分数
+                        txts = [
+                            f"Game: {game_idx + 1}/{CONFIG['games_per_opponent']}",
+                            f"Overall Score: {total_p1}:{total_p2}",
+                            f"Current Round: {env.p1_score}:{env.p2_score}",
+                            f"Opp: {opp_name}"
+                        ]
+                        for i, t in enumerate(txts):
+                            screen.blit(font.render(t, True, (255, 255, 0)), (10, 10 + i * 25))
+                        pygame.display.flip()
+                except:
+                    pass
 
-        if render:
-            env.render()
-            try:
-                screen = pygame.display.get_surface()
-                if screen is not None and font is not None:
-                    # 简单直白的显示
-                    status_text = "UP" if z_val > 0.5 else "DOWN"
-                    color = (0, 255, 0) if z_val > 0.5 else (255, 50, 50)
+            # --- 核心修复：一旦本局结束，立即锁定分数 ---
+            if term or trunc:
+                # 方案：直接从 info 或 env 抓取最后那一秒的分数，立刻跳出循环
+                # 这样可以防止下一局开始后的 reset 逻辑干扰数据
+                this_game_p1 = env.p1_score
+                this_game_p2 = env.p2_score
 
-                    texts = [
-                        f"Temp: {curr_temp:.2f}",
-                        f"Z-Score: {z_val:.2f} [{status_text}]",
-                        f"Opponent: {opp_name}"
-                    ]
-                    for i, text in enumerate(texts):
-                        c = color if i == 1 else (255, 255, 255)
-                        txt_surf = font.render(text, True, c)
-                        screen.blit(txt_surf, (10, 10 + i * 25))
-                    pygame.display.flip()
-            except:
-                pass
-            time.sleep(0.015)
+                total_p1 += this_game_p1
+                total_p2 += this_game_p2
 
-        if term or trunc:
-            done = True
+                if this_game_p2 > this_game_p1:
+                    wins += 1
 
-    result = {
-        "opponent": opp_name,
-        "p1_score": env.p1_score,
-        "p2_score": env.p2_score,
-        "win": env.p2_score > env.p1_score,
-        "final_state": {
-            "mean": diff_manager.mean,
-            "var": diff_manager.var
-        }
-    }
+                done = True  # 退出 while 循环，准备进入下一局 reset
+
     env.close()
-    return result
+    return {
+        "opponent": opp_name,
+        "p1_total": total_p1,
+        "p2_total": total_p2,
+        "v1_mean": np.mean(match_v1_all) if match_v1_all else 0,
+        "v2_mean": np.mean(match_v2_all) if match_v2_all else 0,
+        "win_rate": (wins / CONFIG["games_per_opponent"]) * 100
+    }
 
 
 # --- 3. 控制器 ---
-def run_fast_tournament():
+def run_main(render=False):
     opp_files = [f for f in os.listdir(CONFIG["opponents_dir"]) if f.endswith(".pth")]
     opp_files.sort()
 
-    print(f"🚀 开始并发赛模式 | 并行数: {CONFIG['max_workers']} | 对手总数: {len(opp_files)}")
-    print("=" * 60)
+    print(f"🚀 启动评估 | 总模型: {len(opp_files)} | 每人对战: {CONFIG['games_per_opponent']} 场")
+    print("-" * 115)
 
-    all_results = []
-    with Manager() as manager:
-        # 只共享基础统计量
-        shared_state = manager.dict({
-            "mean": 0.0,
-            "var": 5.0,  # 稍微给点初始方差，避免开局Z值爆炸
-        })
+    final_results = []
+    if not render:
+        # 快速模式
         with ProcessPoolExecutor(max_workers=CONFIG["max_workers"]) as executor:
-            futures = {executor.submit(play_one_match, name, dict(shared_state), False): name for name in opp_files}
-            for future in as_completed(futures):
-                res = future.result()
+            futures = [executor.submit(evaluate_opponent, name, False) for name in opp_files]
+            for f in as_completed(futures):
+                res = f.result()
                 if res:
-                    shared_state.update(res["final_state"])
-                    all_results.append(res)
-                    status = "🏆 WIN" if res['win'] else "❌ LOSS"
-                    print(f"[{status}] {res['opponent'].ljust(25)} | P1: {res['p1_score']} vs P2: {res['p2_score']}")
+                    final_results.append(res)
+                    status = "🏆 WIN" if res['p2_total'] > res['p1_total'] else "❌ LOSS"
+                    print(
+                        f"{status:<8} | {res['opponent'].ljust(25)} | {res['p1_total']} vs {res['p2_total']} | V1:{res['v1_mean']:>8.2f} || V2:{res['v2_mean']:>8.2f}")
+    else:
+        # 观战模式
+        for name in opp_files:
+            res = evaluate_opponent(name, True)
+            if res is None: break
+            final_results.append(res)
+            status = "🏆 WIN" if res['p2_total'] > res['p1_total'] else "❌ LOSS"
+            print(
+                f"{status:<8} | {res['opponent'].ljust(25)} | {res['p1_total']} vs {res['p2_total']} | V1:{res['v1_mean']:>8.2f} V2:{res['v2_mean']:>8.2f}")
 
-    print("\n" + "=" * 60)
-    print("📊 最终战绩统计")
-    print("-" * 60)
-    wins = sum(1 for r in all_results if r['win'])
-    total = len(all_results)
-    if total > 0:
-        print(f"总场次: {total} | 胜率: {wins / total:.2%} | 胜: {wins} / 负: {total - wins}")
-    print("=" * 60)
+    print("-" * 115)
+    print("📊 最终战绩排名 (按 P2 总分排序)")
+    sorted_results = sorted(final_results, key=lambda x: x['p2_total'], reverse=True)
+    for r in sorted_results:
+        indicator = "✅" if r['p2_total'] > r['p1_total'] else "🔻"
+        print(
+            f"{indicator} {r['opponent'].ljust(25)} | 总比分: {r['p1_total']}:{r['p2_total']} | 胜率: {r['win_rate']:.1f}%")
 
 
 if __name__ == "__main__":
-    mode = input("1. 快速模式 (并发+无渲染)\n2. 观战模式 (单线程+有渲染)\n请选择: ")
-
-    if mode == "1":
-        run_fast_tournament()
-    else:
+    mode = input("1. 快速模式\n2. 观战模式\n请选择: ")
+    if mode == "2":
         pygame.init()
-        if not pygame.font.get_init():
-            pygame.font.init()
-
-        opp_files = [f for f in os.listdir(CONFIG["opponents_dir"]) if f.endswith(".pth")]
-        opp_files.sort()
-
-        current_state = {"mean": 0.0, "var": 5.0}
-
-        print("\n📺 进入观战模式...")
-        for f in opp_files:
-            if f == os.path.basename(CONFIG["adaptive_model_path"]): continue
-            print(f"🎮 正在对战: {f}")
-
-            res = play_one_match(f, current_state, render=True)
-
-            if res is None: break
-
-            # 更新状态传给下一场
-            current_state = res["final_state"]
-            status = "🏆 WIN" if res['win'] else "❌ LOSS"
-            print(f"[{status}] 战局结束 | P1: {res['p1_score']} vs P2: {res['p2_score']}")
-            print("-" * 40)
-
+        run_main(render=True)
         pygame.quit()
+    else:
+        run_main(render=False)
